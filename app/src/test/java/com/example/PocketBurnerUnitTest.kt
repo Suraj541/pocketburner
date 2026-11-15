@@ -14,6 +14,9 @@ import com.example.engine.TransportManager
 import com.example.hardware.DeviceFamily
 import com.example.hardware.FirmwareCategory
 import com.example.hardware.HardwareRegistry
+import com.sun.net.httpserver.HttpServer
+import java.io.File
+import java.net.InetSocketAddress
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -300,5 +303,239 @@ class PocketBurnerUnitTest {
         assertEquals(ScriptLanguage.JAVASCRIPT, ScriptLanguage.detectFromFileName("agent.js"))
         assertEquals(ScriptLanguage.LUA, ScriptLanguage.detectFromFileName("init.lua"))
         assertEquals(ScriptLanguage.YAML_JSON, ScriptLanguage.detectFromFileName("node.yaml"))
+    }
+
+    @Test
+    fun usbSerialBridgeDetection_identifiesAllChipsetsAndBaudRates() {
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.CP210X,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x10C4, 0xEA60),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.CH340_CH9102,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x1A86, 0x7523),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.FTDI,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x0403, 0x6001),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.PL2303,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x067B, 0x2303),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.ESPRESSIF_NATIVE_USB,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x303A, 0x1001),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.ARDUINO_CDC,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x2341, 0x0043),
+        )
+        assertEquals(
+            com.example.engine.UsbSerialBridgeType.RP2040_RP2350,
+            com.example.engine.TransportManager.identifyUsbSerialBridge(0x2E8A, 0x0003),
+        )
+        assertTrue(com.example.engine.TransportManager.SUPPORTED_USB_BAUD_RATES.containsAll(listOf(9600, 115200, 921600)))
+    }
+
+    @Test
+    fun launcherBridgeTrustAndBinaryDetection_validatesOriginsAndFirmwareUrls() {
+        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://web.esphome.io/"))
+        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("http://192.168.4.1/"))
+        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://bmorcelli.github.io/Launcher/"))
+        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("file:///android_asset/launcher_webui.html"))
+        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("http://launcher.local/update"))
+        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://untrusted-site.example.com/"))
+
+        assertTrue(
+            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
+                "https://github.com/bmorcelli/Launcher/releases/download/2.5.0/Launcher-m5stack-cardputer.bin",
+                null,
+                null,
+            )
+        )
+        assertTrue(
+            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
+                "https://example.org/pico.uf2",
+                null,
+                "application/octet-stream",
+            )
+        )
+        assertFalse(
+            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
+                "https://github.com/bmorcelli/Launcher",
+                null,
+                "text/html",
+            )
+        )
+    }
+
+    @Test
+    fun wifiOtaConfig_buildsCleanHttpHttpsUrlsAndParsesLauncherTargets() {
+        val httpDefault = com.example.engine.WifiOtaTargetConfig(
+            useHttps = false,
+            host = "http://192.168.4.1/",
+            port = 80,
+            endpointPath = "update",
+        )
+        assertEquals("http://192.168.4.1/update", httpDefault.buildTargetUrl())
+
+        val httpsCustom = com.example.engine.WifiOtaTargetConfig(
+            useHttps = true,
+            host = "esp32-ota.local",
+            port = 8443,
+            endpointPath = "/ota/upload",
+        )
+        assertEquals("https://esp32-ota.local:8443/ota/upload", httpsCustom.buildTargetUrl())
+
+        val fallbackParsed = com.example.ui.launcher.LauncherViewModel.parseTargetConfig(
+            rawUrl = "file:///android_asset/launcher_webui.html",
+            protocol = com.example.engine.OtaUploadProtocol.ESP_MULTIPART_UPDATE,
+            fallbackHost = "192.168.1.55",
+        )
+        assertEquals("192.168.1.55", fallbackParsed.host)
+        assertEquals("/update", fallbackParsed.endpointPath)
+        assertFalse(fallbackParsed.useHttps)
+
+        val directHttpsParsed = com.example.ui.launcher.LauncherViewModel.parseTargetConfig(
+            rawUrl = "https://192.168.1.88:8443/upload",
+            protocol = com.example.engine.OtaUploadProtocol.LAUNCHER_SD_UPLOAD,
+        )
+        assertTrue(directHttpsParsed.useHttps)
+        assertEquals("192.168.1.88", directHttpsParsed.host)
+        assertEquals(8443, directHttpsParsed.port)
+        assertEquals("/upload", directHttpsParsed.endpointPath)
+    }
+
+    @Test
+    fun wifiOtaUploader_probesAndPushesFirmwareOverLoopbackHttpServer() = kotlinx.coroutines.test.runTest {
+        var receivedMd5Header: String? = null
+        var receivedAuthHeader: String? = null
+        var receivedOtaPassword: String? = null
+        var receivedBodyBytes = 0
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/update") { exchange ->
+            if (exchange.requestMethod == "GET") {
+                val ok = "OTA Endpoint Ready".toByteArray()
+                exchange.sendResponseHeaders(200, ok.size.toLong())
+                exchange.responseBody.use { it.write(ok) }
+            } else {
+                receivedMd5Header = exchange.requestHeaders.getFirst("X-Firmware-MD5")
+                receivedAuthHeader = exchange.requestHeaders.getFirst("Authorization")
+                receivedOtaPassword = exchange.requestHeaders.getFirst("X-OTA-Password")
+                receivedBodyBytes = exchange.requestBody.readBytes().size
+                val reply = "Flash OK".toByteArray()
+                exchange.sendResponseHeaders(200, reply.size.toLong())
+                exchange.responseBody.use { it.write(reply) }
+            }
+        }
+        server.createContext("/reject") { exchange ->
+            exchange.requestBody.readBytes()
+            val err = "Unauthorized".toByteArray()
+            exchange.sendResponseHeaders(401, err.size.toLong())
+            exchange.responseBody.use { it.write(err) }
+        }
+        server.start()
+
+        val tempBin = File.createTempFile("pocketburner_ota_test", ".bin").apply {
+            writeBytes(ByteArray(24 * 1024) { idx -> (idx and 0xFF).toByte() })
+            deleteOnExit()
+        }
+
+        try {
+            val port = server.address.port
+            val uploader = com.example.engine.WifiOtaUploader()
+            val (expectedMd5, expectedSha) = com.example.engine.WifiOtaUploader.computeDigests(tempBin)
+
+            val config = com.example.engine.WifiOtaTargetConfig(
+                useHttps = false,
+                host = "127.0.0.1",
+                port = port,
+                endpointPath = "/update",
+                protocol = com.example.engine.OtaUploadProtocol.ESP_MULTIPART_UPDATE,
+                otaPassword = "esp-ota-secret",
+            )
+
+            val probe = uploader.probeEndpoint(config)
+            assertTrue(probe.isSuccess)
+
+            val progressUpdates = mutableListOf<Long>()
+            val push = uploader.pushFirmwareBinary(tempBin, config) { sent, _, _ ->
+                progressUpdates.add(sent)
+            }
+            assertTrue("Expected OTA push success, got: ${push.exceptionOrNull()}", push.isSuccess)
+            val outcome = push.getOrThrow()
+            assertEquals(200, outcome.httpCode)
+            assertEquals(tempBin.length(), outcome.bytesSent)
+            assertEquals(expectedMd5, outcome.md5Hex)
+            assertEquals(expectedSha, outcome.sha256Hex)
+            assertEquals("Flash OK", outcome.serverResponse)
+            assertEquals(expectedMd5, receivedMd5Header)
+            assertTrue(receivedAuthHeader?.startsWith("Basic ") == true)
+            assertEquals("esp-ota-secret", receivedOtaPassword)
+            assertTrue(receivedBodyBytes > tempBin.length())
+            assertTrue(progressUpdates.any { it == tempBin.length() })
+
+            val failConfig = config.copy(
+                endpointPath = "/reject",
+                protocol = com.example.engine.OtaUploadProtocol.ARDUINO_RAW_BINARY,
+            )
+            val failPush = uploader.pushFirmwareBinary(tempBin, failConfig) { _, _, _ -> }
+            assertTrue(failPush.isFailure)
+            assertTrue(failPush.exceptionOrNull()?.message?.contains("401") == true)
+        } finally {
+            server.stop(0)
+            tempBin.delete()
+        }
+    }
+
+    @Test
+    fun bmorcelliFullCatalog_parsesAllAssetsAndJsonFeedsWithoutTruncation() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val container = AppContainer.getInstance(context)
+        val engine = container.firmwareCatalogEngine
+
+        assertTrue(engine.defaultRepositories.any { it.id == "repo_bmorcelli_catalog" })
+
+        val assetsArray = (1..48).joinToString(",") { idx ->
+            val boardSuffix = if (idx == 48) "m5stack-cardputer-adv" else "board-$idx"
+            """{"name":"Launcher-$boardSuffix.bin","size":655360,"browser_download_url":"https://example.org/Launcher-$boardSuffix.bin"}"""
+        }
+        val releaseJson = """
+            {
+              "tag_name": "2.6.0",
+              "body": "M5Launcher Release",
+              "author": {"login": "bmorcelli"},
+              "assets": [$assetsArray]
+            }
+        """.trimIndent()
+        val parsedRelease = engine.parseGitHubReleaseFeed(releaseJson, "repo_bmorcelli_launcher", "M5Launcher (bmorcelli/Launcher)")
+        assertEquals(48, parsedRelease.size)
+        assertTrue(parsedRelease.last().deviceTagsCsv.contains("Cardputer ADV"))
+
+        val m5JsonFwFeed = """
+            [
+              {
+                "name": "Bruce",
+                "author": "pr3y",
+                "board": "M5Stack Cardputer",
+                "category": "Security Research",
+                "version": "1.10",
+                "cover": "bruce_cover.png",
+                "files": [
+                  {"address": "0x1000", "path": "bootloader.bin"},
+                  {"address": "0x10000", "path": "bruce_cardputer.bin"}
+                ]
+              }
+            ]
+        """.trimIndent()
+        val parsedCatalog = engine.parseM5BurnerFeed(m5JsonFwFeed, "repo_bmorcelli_catalog")
+        assertEquals(1, parsedCatalog.size)
+        assertEquals("Bruce", parsedCatalog.first().title)
+        assertTrue(parsedCatalog.first().deviceTagsCsv.contains("Cardputer"))
+        assertEquals("0x10000", parsedCatalog.first().flashOffset)
+        assertEquals("https://m5burner-cdn.m5stack.com/firmware/bruce_cardputer.bin", parsedCatalog.first().downloadUrl)
+        assertEquals("https://m5burner-cdn.m5stack.com/cover/bruce_cover.png", parsedCatalog.first().coverImageUrl)
     }
 }

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Silicon Labs CP210x USB-to-UART -->
+    <usb-device vendor-id="4292" />
+    <!-- WCH CH340 / CH341 / CH9102 -->
+    <usb-device vendor-id="6790" />
+    <!-- FTDI FT232R / FT2232 / FT231X -->
+    <usb-device vendor-id="1027" />
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" />
+    <!-- Espressif Native USB-Serial/JTAG & OTG (ESP32-S2/S3/C3/C6/P4) -->
+    <usb-device vendor-id="12346" />
+    <!-- Arduino Official & Genuino -->
+    <usb-device vendor-id="9025" />
+    <usb-device vendor-id="10755" />
+    <!-- Raspberry Pi RP2040 / RP2350 Pico -->
+    <usb-device vendor-id="11914" />
+    <!-- Generic USB CDC-ACM Serial Interfaces -->
+    <usb-device class="2" subclass="2" />
+    <usb-device class="10" />
+</resources>

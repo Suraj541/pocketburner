@@ -23,13 +23,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothSearching
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Usb
@@ -44,8 +47,10 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -65,16 +70,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.TransportType
 import com.example.engine.ActiveConnection
 import com.example.engine.BleBondStatus
 import com.example.engine.CryptoEnvelopeEngine
+import com.example.engine.OtaUploadProtocol
+import com.example.engine.TransportManager
+import com.example.engine.WifiOtaTargetConfig
 import com.example.hardware.HardwareRegistry
 import com.example.ui.components.ConnectionStatusPill
 import com.example.ui.components.EncryptionTogglePill
 import com.example.ui.components.HardwareSpecInspectorDialog
+import com.example.ui.theme.LocalHardwareStatusColors
 import com.example.ui.theme.MonoTextStyles
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -85,6 +95,11 @@ fun ConnectScreen(
 ) {
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
     val usbDevices by viewModel.usbDevices.collectAsStateWithLifecycle()
+    val usbServiceRunning by viewModel.usbServiceRunning.collectAsStateWithLifecycle()
+    val usbFlashState by viewModel.usbFlashState.collectAsStateWithLifecycle()
+    val wifiOtaServiceRunning by viewModel.wifiOtaServiceRunning.collectAsStateWithLifecycle()
+    val wifiOtaState by viewModel.wifiOtaState.collectAsStateWithLifecycle()
+    val readyBinaries by viewModel.readyBinaries.collectAsStateWithLifecycle()
     val bleDevices by viewModel.filteredBleDevices.collectAsStateWithLifecycle()
     val isBleScanning by viewModel.isBleScanning.collectAsStateWithLifecycle()
     val bleServiceRunning by viewModel.bleServiceRunning.collectAsStateWithLifecycle()
@@ -97,11 +112,70 @@ fun ConnectScreen(
     val savedProfiles by viewModel.savedProfiles.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
 
+    val activeBoardSpec = remember(settings.selectedBoardId, connectionState) {
+        (connectionState as? ActiveConnection.UsbConnected)?.board
+            ?: HardwareRegistry.findById(settings.selectedBoardId)
+            ?: HardwareRegistry.boards.first()
+    }
+
     var selectedTab by remember { mutableIntStateOf(0) }
     var wifiHost by remember { mutableStateOf("192.168.4.1") }
     var wifiPort by remember { mutableStateOf("8080") }
     var wifiUseTls by remember { mutableStateOf(settings.encryptionEnabled) }
     var showBoardRegistry by remember { mutableStateOf(false) }
+
+    // Wi-Fi HTTP/HTTPS OTA target parameters
+    var otaHost by remember { mutableStateOf("192.168.4.1") }
+    var otaPort by remember { mutableStateOf("80") }
+    var otaUseHttps by remember { mutableStateOf(false) }
+    var otaProtocol by remember { mutableStateOf(OtaUploadProtocol.ESP_MULTIPART_UPDATE) }
+    var otaEndpointPath by remember { mutableStateOf(OtaUploadProtocol.ESP_MULTIPART_UPDATE.defaultPath) }
+    var otaPassword by remember { mutableStateOf("") }
+    var selectedFirmwareIdForOta by remember { mutableStateOf<String?>(null) }
+
+    val buildOtaConfig: () -> WifiOtaTargetConfig = {
+        WifiOtaTargetConfig(
+            useHttps = otaUseHttps,
+            host = otaHost,
+            port = otaPort.toIntOrNull() ?: if (otaUseHttps) 443 else 80,
+            endpointPath = otaEndpointPath,
+            protocol = otaProtocol,
+            otaPassword = otaPassword,
+            allowSelfSignedTls = settings.allowSelfSignedTls,
+        )
+    }
+
+    var usbFlashOffset by remember(activeBoardSpec.id) { mutableStateOf(activeBoardSpec.appOffset) }
+    var usbEraseBeforeFlash by remember { mutableStateOf(false) }
+    var selectedFirmwareIdForUsb by remember { mutableStateOf<String?>(null) }
+
+    val usbBinaryPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            if (uri != null) {
+                viewModel.importAndFlashLocalUri(
+                    uri = uri,
+                    board = activeBoardSpec,
+                    baudRate = settings.defaultBaudRate,
+                    flashOffsetHex = usbFlashOffset,
+                    eraseBeforeFlash = usbEraseBeforeFlash,
+                )
+            }
+        },
+    )
+
+    val wifiOtaPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            if (uri != null) {
+                viewModel.importAndPushWifiOtaUri(
+                    uri = uri,
+                    board = activeBoardSpec,
+                    config = buildOtaConfig(),
+                )
+            }
+        },
+    )
 
     val blePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
@@ -271,48 +345,313 @@ fun ConnectScreen(
             // USB OTG TAB
             0 -> {
                 item {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        modifier = Modifier.fillMaxWidth(),
+                    ElevatedCard(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.elevatedCardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("usb_otg_service_card"),
                     ) {
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf(9600, 57600, 115200, 460800, 921600).forEach { baud ->
-                                FilterChip(
-                                    selected = settings.defaultBaudRate == baud,
-                                    onClick = { viewModel.setDefaultBaudRate(baud) },
-                                    label = { Text("$baud") },
-                                )
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Filled.Usb, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text("USB OTG Serial & Flasher Service", style = MaterialTheme.typography.titleSmall)
+                                        Text(
+                                            text = when {
+                                                usbFlashState.isFlashing -> "Flashing ${usbFlashState.firmwareTitle} @ ${usbFlashState.baudRate} bps"
+                                                connectionState is ActiveConnection.UsbConnected -> {
+                                                    val usb = connectionState as ActiveConnection.UsbConnected
+                                                    "Foreground Active • ${usb.deviceLabel} @ ${usb.baudRate} baud"
+                                                }
+                                                usbServiceRunning -> "Service Bound • Ready (CP210x, CH340, FTDI, PL2303, CDC)"
+                                                else -> "Starts connectedDevice foreground service on connect/flash"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (usbServiceRunning || connectionState is ActiveConnection.UsbConnected) {
+                                        TextButton(
+                                            onClick = viewModel::stopUsbService,
+                                            modifier = Modifier.testTag("usb_stop_service_button"),
+                                        ) {
+                                            Text("Stop")
+                                        }
+                                    }
+                                    IconButton(onClick = viewModel::refreshUsb, modifier = Modifier.testTag("refresh_usb_button")) {
+                                        Icon(Icons.Filled.Refresh, contentDescription = "Scan USB serial devices")
+                                    }
+                                }
                             }
-                        }
-                        IconButton(onClick = viewModel::refreshUsb, modifier = Modifier.testTag("refresh_usb_button")) {
-                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh USB devices")
+
+                            Text("Serial Baud Rate Selection (bps)", style = MaterialTheme.typography.labelMedium)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                TransportManager.SUPPORTED_USB_BAUD_RATES.forEach { baud ->
+                                    FilterChip(
+                                        selected = settings.defaultBaudRate == baud,
+                                        onClick = { viewModel.setDefaultBaudRate(baud) },
+                                        label = { Text("$baud") },
+                                        modifier = Modifier.testTag("usb_baud_$baud"),
+                                    )
+                                }
+                            }
+
+                            if (connectionState is ActiveConnection.UsbConnected) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                    OutlinedButton(
+                                        onClick = viewModel::pulseUsbBootloader,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("usb_bootloader_pulse_button"),
+                                    ) {
+                                        Icon(Icons.Filled.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("DTR/RTS Boot Reset")
+                                    }
+                                    OutlinedButton(
+                                        onClick = viewModel::disconnect,
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Text("Disconnect USB")
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+
                 if (usbDevices.isEmpty()) {
                     item {
                         EmptyTransportCard(
-                            title = "No USB OTG Serial Device Detected",
-                            subtitle = "Plug an ESP8266, ESP32/S3/C3/C6, M5Stack, Arduino, or Raspberry Pi Pico via USB-C OTG adapter, then tap Refresh.",
+                            title = "No USB-to-Serial Device Detected",
+                            subtitle = "Plug an ESP8266/ESP32/S3/C3/C6, M5Stack, Arduino, Raspberry Pi Pico, or CP210x/CH340/FTDI/PL2303 adapter via OTG, then tap Refresh.",
                         )
                     }
                 } else {
                     items(usbDevices, key = { it.deviceName }) { dev ->
+                        val isUsbActive = (connectionState as? ActiveConnection.UsbConnected)?.deviceLabel == dev.productLabel
                         ElevatedCard(shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
+                            Column(
                                 modifier = Modifier.padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(dev.productLabel, style = MaterialTheme.typography.titleSmall)
+                                        Text(
+                                            "VID:PID %04X:%04X • %s".format(dev.vendorId, dev.productId, dev.matchedBoard.displayName),
+                                            style = MonoTextStyles.HexBadge,
+                                        )
+                                    }
+                                    Button(
+                                        onClick = { viewModel.connectOrRequestUsb(dev.usbDevice) },
+                                        modifier = Modifier.testTag("usb_connect_${dev.vendorId}_${dev.productId}"),
+                                    ) {
+                                        Text(
+                                            when {
+                                                isUsbActive -> "Reconnect"
+                                                dev.hasPermission -> "Connect"
+                                                else -> "Grant USB"
+                                            }
+                                        )
+                                    }
+                                }
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.secondaryContainer,
+                                        shape = RoundedCornerShape(6.dp),
+                                    ) {
+                                        Text(
+                                            text = dev.bridgeType.chipsetLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        )
+                                    }
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        shape = RoundedCornerShape(6.dp),
+                                    ) {
+                                        Text(
+                                            text = dev.matchedBoard.protocol.label,
+                                            style = MonoTextStyles.HexBadge,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Direct Binary Firmware Flasher via USB OTG Manager Service
+                item {
+                    val statusColors = LocalHardwareStatusColors.current
+                    val chosenFirmware = remember(readyBinaries, selectedFirmwareIdForUsb) {
+                        readyBinaries.firstOrNull { it.id == selectedFirmwareIdForUsb } ?: readyBinaries.firstOrNull()
+                    }
+                    ElevatedCard(
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("usb_binary_flasher_card"),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.Bolt, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.width(8.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(dev.productLabel, style = MaterialTheme.typography.titleSmall)
+                                    Text("USB OTG Binary Firmware Flasher", style = MaterialTheme.typography.titleSmall)
                                     Text(
-                                        "Detected: ${dev.matchedBoard.displayName} (%04X:%04X)".format(dev.vendorId, dev.productId),
-                                        style = MonoTextStyles.HexBadge,
+                                        "Target: ${activeBoardSpec.displayName} (${activeBoardSpec.protocol.label})",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
-                                Button(onClick = { viewModel.connectOrRequestUsb(dev.usbDevice) }) {
-                                    Text(if (dev.hasPermission) "Connect" else "Grant USB")
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedTextField(
+                                    value = usbFlashOffset,
+                                    onValueChange = { usbFlashOffset = it },
+                                    label = { Text("Flash Offset") },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Erase Flash", style = MaterialTheme.typography.bodySmall)
+                                    Spacer(Modifier.width(6.dp))
+                                    Switch(
+                                        checked = usbEraseBeforeFlash,
+                                        onCheckedChange = { usbEraseBeforeFlash = it },
+                                    )
+                                }
+                            }
+
+                            if (readyBinaries.isNotEmpty()) {
+                                Text("Downloaded / Imported Binaries:", style = MaterialTheme.typography.labelMedium)
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    readyBinaries.take(6).forEach { fw ->
+                                        FilterChip(
+                                            selected = chosenFirmware?.id == fw.id,
+                                            onClick = {
+                                                selectedFirmwareIdForUsb = fw.id
+                                                usbFlashOffset = fw.flashOffset.ifBlank { activeBoardSpec.appOffset }
+                                            },
+                                            label = { Text(fw.title.take(22), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (usbFlashState.isFlashing || usbFlashState.resultMessage != null) {
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (usbFlashState.isError) {
+                                        MaterialTheme.colorScheme.errorContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            Text(
+                                                text = usbFlashState.resultMessage ?: usbFlashState.statusText,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = when {
+                                                    usbFlashState.isError -> MaterialTheme.colorScheme.error
+                                                    usbFlashState.progress >= 1f -> statusColors.connected
+                                                    else -> MaterialTheme.colorScheme.onSurface
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (!usbFlashState.isFlashing) {
+                                                TextButton(onClick = viewModel::clearUsbFlashState) { Text("Clear") }
+                                            }
+                                        }
+                                        if (usbFlashState.isFlashing) {
+                                            LinearProgressIndicator(
+                                                progress = { usbFlashState.progress },
+                                                modifier = Modifier.fillMaxWidth(),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                FilledTonalButton(
+                                    onClick = { usbBinaryPickerLauncher.launch(arrayOf("*/*")) },
+                                    enabled = !usbFlashState.isFlashing,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("usb_pick_flash_binary_button"),
+                                ) {
+                                    Icon(Icons.Filled.FileOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Pick .bin & Flash")
+                                }
+                                Button(
+                                    onClick = {
+                                        if (chosenFirmware != null) {
+                                            viewModel.flashExistingBinaryViaUsb(
+                                                firmware = chosenFirmware,
+                                                board = activeBoardSpec,
+                                                baudRate = settings.defaultBaudRate,
+                                                flashOffsetHex = usbFlashOffset,
+                                                eraseBeforeFlash = usbEraseBeforeFlash,
+                                            )
+                                        } else {
+                                            usbBinaryPickerLauncher.launch(arrayOf("*/*"))
+                                        }
+                                    },
+                                    enabled = !usbFlashState.isFlashing,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("usb_flash_selected_button"),
+                                ) {
+                                    Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (chosenFirmware != null) "Flash @ ${settings.defaultBaudRate}" else "Select Binary")
                                 }
                             }
                         }
@@ -578,11 +917,12 @@ fun ConnectScreen(
                 }
             }
 
-            // WI-FI / TLS TAB
+            // WI-FI / TLS & HTTP/HTTPS OTA TAB
             2 -> {
                 item {
                     ElevatedCard(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("TCP / TLS Command Socket", style = MaterialTheme.typography.titleSmall)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedTextField(
                                     value = wifiHost,
@@ -626,16 +966,257 @@ fun ConnectScreen(
                         }
                     }
                 }
+
+                // Wi-Fi HTTP/HTTPS OTA Firmware Flashing Service Card
+                item {
+                    val statusColors = LocalHardwareStatusColors.current
+                    val chosenOtaFirmware = remember(readyBinaries, selectedFirmwareIdForOta) {
+                        readyBinaries.firstOrNull { it.id == selectedFirmwareIdForOta } ?: readyBinaries.firstOrNull()
+                    }
+                    ElevatedCard(
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("wifi_ota_flashing_card"),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Filled.Wifi, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text("Wi-Fi OTA (HTTP/HTTPS) Flasher Service", style = MaterialTheme.typography.titleSmall)
+                                        Text(
+                                            text = when {
+                                                wifiOtaState.isFlashing -> "${wifiOtaState.firmwareTitle} -> ${wifiOtaState.targetUrl}"
+                                                wifiOtaServiceRunning -> "Foreground Service Bound • Push .bin over LAN HTTP/HTTPS"
+                                                else -> "Starts connectedDevice foreground service for OTA push"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Switch(
+                                        checked = otaUseHttps,
+                                        onCheckedChange = { https ->
+                                            otaUseHttps = https
+                                            if (otaPort == "80" && https) otaPort = "443"
+                                            else if (otaPort == "443" && !https) otaPort = "80"
+                                        },
+                                        modifier = Modifier.testTag("wifi_ota_https_switch"),
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (otaUseHttps) "HTTPS" else "HTTP", style = MonoTextStyles.HexBadge)
+                                }
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    value = otaHost,
+                                    onValueChange = { otaHost = it },
+                                    label = { Text("OTA Host / IP (e.g. 192.168.4.1)") },
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .weight(2f)
+                                        .testTag("wifi_ota_host_input"),
+                                )
+                                OutlinedTextField(
+                                    value = otaPort,
+                                    onValueChange = { otaPort = it },
+                                    label = { Text("Port") },
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("wifi_ota_port_input"),
+                                )
+                            }
+
+                            Text("OTA Endpoint Protocol", style = MaterialTheme.typography.labelMedium)
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                OtaUploadProtocol.entries.forEach { proto ->
+                                    FilterChip(
+                                        selected = otaProtocol == proto,
+                                        onClick = {
+                                            otaProtocol = proto
+                                            otaEndpointPath = proto.defaultPath
+                                        },
+                                        label = { Text(proto.label) },
+                                        modifier = Modifier.testTag("wifi_ota_proto_${proto.name.lowercase()}"),
+                                    )
+                                }
+                            }
+                            Text(
+                                text = otaProtocol.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    value = otaEndpointPath,
+                                    onValueChange = { otaEndpointPath = it },
+                                    label = { Text("Endpoint Path") },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                OutlinedTextField(
+                                    value = otaPassword,
+                                    onValueChange = { otaPassword = it },
+                                    label = { Text("OTA Auth Pass (Optional)") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+
+                            if (readyBinaries.isNotEmpty()) {
+                                Text("Select Ready Binary for OTA Push:", style = MaterialTheme.typography.labelMedium)
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    readyBinaries.take(6).forEach { fw ->
+                                        FilterChip(
+                                            selected = chosenOtaFirmware?.id == fw.id,
+                                            onClick = { selectedFirmwareIdForOta = fw.id },
+                                            label = { Text(fw.title.take(22), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (wifiOtaState.isFlashing || wifiOtaState.resultMessage != null) {
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (wifiOtaState.isError) {
+                                        MaterialTheme.colorScheme.errorContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            Text(
+                                                text = wifiOtaState.resultMessage ?: wifiOtaState.statusText,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = when {
+                                                    wifiOtaState.isError -> MaterialTheme.colorScheme.error
+                                                    wifiOtaState.progress >= 1f -> statusColors.connected
+                                                    else -> MaterialTheme.colorScheme.onSurface
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (!wifiOtaState.isFlashing) {
+                                                TextButton(onClick = viewModel::clearWifiOtaState) { Text("Clear") }
+                                            }
+                                        }
+                                        if (wifiOtaState.isFlashing) {
+                                            LinearProgressIndicator(
+                                                progress = { wifiOtaState.progress },
+                                                modifier = Modifier.fillMaxWidth(),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                OutlinedButton(
+                                    onClick = { viewModel.probeWifiOtaEndpoint(buildOtaConfig()) },
+                                    enabled = !wifiOtaState.isFlashing,
+                                    modifier = Modifier.testTag("wifi_ota_probe_button"),
+                                ) {
+                                    Text("Probe")
+                                }
+                                FilledTonalButton(
+                                    onClick = { wifiOtaPickerLauncher.launch(arrayOf("*/*")) },
+                                    enabled = !wifiOtaState.isFlashing,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("wifi_ota_pick_binary_button"),
+                                ) {
+                                    Icon(Icons.Filled.FileOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Pick .bin")
+                                }
+                                if (wifiOtaState.isFlashing) {
+                                    Button(
+                                        onClick = viewModel::cancelWifiOta,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("wifi_ota_cancel_button"),
+                                    ) {
+                                        Text("Cancel OTA")
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = {
+                                            if (chosenOtaFirmware != null) {
+                                                viewModel.pushFirmwareViaWifiOta(chosenOtaFirmware, buildOtaConfig())
+                                            } else {
+                                                wifiOtaPickerLauncher.launch(arrayOf("*/*"))
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("wifi_ota_push_button"),
+                                    ) {
+                                        Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(if (chosenOtaFirmware != null) "Push OTA" else "Select .bin")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 items(networkEndpoints, key = { "${it.host}:${it.port}" }) { ep ->
                     ElevatedCard(shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.padding(12.dp),
+                        ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(ep.serviceName, style = MaterialTheme.typography.titleSmall)
                                 Text("${ep.host}:${ep.port} (${ep.serviceType})", style = MonoTextStyles.HexBadge)
                             }
+                            OutlinedButton(
+                                onClick = {
+                                    otaHost = ep.host
+                                    otaPort = ep.port.toString()
+                                },
+                            ) { Text("Set OTA") }
                             FilledTonalButton(onClick = {
                                 wifiHost = ep.host
                                 wifiPort = ep.port.toString()
+                                otaHost = ep.host
                                 viewModel.connectWifi(ep.host, ep.port, wifiUseTls)
                             }) { Text("Use") }
                         }

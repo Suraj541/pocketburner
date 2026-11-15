@@ -63,6 +63,43 @@ data class TerminalLogEntry(
     val detail: String? = null,
 )
 
+enum class UsbSerialBridgeType(
+    val chipsetLabel: String,
+    val driverProtocol: String,
+) {
+    CP210X("Silicon Labs CP210x", "CP210x Vendor Control"),
+    CH340_CH9102("WCH CH340 / CH9102", "CH34x Vendor Serial"),
+    FTDI("FTDI FT232R / FT2232", "FTDI D2XX/VCP"),
+    PL2303("Prolific PL2303", "PL2303 Vendor Serial"),
+    ESPRESSIF_NATIVE_USB("Espressif USB-Serial/JTAG", "USB CDC-ACM + JTAG"),
+    ARDUINO_CDC("Arduino USB CDC-ACM", "CDC-ACM"),
+    RP2040_RP2350("RPi Pico / RP2350 USB", "CDC-ACM / UF2"),
+    CDC_ACM("Generic USB CDC-ACM", "Standard USB CDC-ACM"),
+}
+
+data class UsbFlashProgressState(
+    val isFlashing: Boolean = false,
+    val progress: Float = 0f,
+    val statusText: String = "",
+    val firmwareTitle: String = "",
+    val boardId: String = "",
+    val baudRate: Int = 115200,
+    val resultMessage: String? = null,
+    val isError: Boolean = false,
+)
+
+data class WifiOtaProgressState(
+    val isFlashing: Boolean = false,
+    val progress: Float = 0f,
+    val bytesSent: Long = 0L,
+    val totalBytes: Long = 0L,
+    val statusText: String = "",
+    val firmwareTitle: String = "",
+    val targetUrl: String = "",
+    val resultMessage: String? = null,
+    val isError: Boolean = false,
+)
+
 data class DiscoveredUsbDevice(
     val deviceName: String,
     val vendorId: Int,
@@ -71,6 +108,8 @@ data class DiscoveredUsbDevice(
     val matchedBoard: HardwareBoardSpec,
     val hasPermission: Boolean,
     val usbDevice: UsbDevice,
+    val bridgeType: UsbSerialBridgeType = UsbSerialBridgeType.CDC_ACM,
+    val serialNumber: String? = null,
 )
 
 enum class BleBondStatus(val label: String) {
@@ -152,6 +191,18 @@ class TransportManager(
 
     private val _usbDevices = MutableStateFlow<List<DiscoveredUsbDevice>>(emptyList())
     val usbDevices: StateFlow<List<DiscoveredUsbDevice>> = _usbDevices.asStateFlow()
+
+    private val _usbServiceRunning = MutableStateFlow(false)
+    val usbServiceRunning: StateFlow<Boolean> = _usbServiceRunning.asStateFlow()
+
+    private val _usbFlashState = MutableStateFlow(UsbFlashProgressState())
+    val usbFlashState: StateFlow<UsbFlashProgressState> = _usbFlashState.asStateFlow()
+
+    private val _wifiOtaServiceRunning = MutableStateFlow(false)
+    val wifiOtaServiceRunning: StateFlow<Boolean> = _wifiOtaServiceRunning.asStateFlow()
+
+    private val _wifiOtaState = MutableStateFlow(WifiOtaProgressState())
+    val wifiOtaState: StateFlow<WifiOtaProgressState> = _wifiOtaState.asStateFlow()
 
     private val _bleDevices = MutableStateFlow<List<DiscoveredBleDevice>>(emptyList())
     val bleDevices: StateFlow<List<DiscoveredBleDevice>> = _bleDevices.asStateFlow()
@@ -358,20 +409,67 @@ class TransportManager(
         }
     }
 
+    fun setUsbServiceRunning(running: Boolean) {
+        _usbServiceRunning.value = running
+    }
+
+    fun updateUsbFlashState(state: UsbFlashProgressState) {
+        _usbFlashState.value = state
+    }
+
+    fun setWifiOtaServiceRunning(running: Boolean) {
+        _wifiOtaServiceRunning.value = running
+    }
+
+    fun updateWifiOtaState(state: WifiOtaProgressState) {
+        _wifiOtaState.value = state
+    }
+
     fun refreshUsbDevices() {
-        val list = usbManager.deviceList.values.map { dev ->
-            val board = HardwareRegistry.identifyByUsb(dev.vendorId, dev.productId, dev.productName)
-            DiscoveredUsbDevice(
-                deviceName = dev.deviceName,
-                vendorId = dev.vendorId,
-                productId = dev.productId,
-                productLabel = dev.productName ?: "USB Serial (%04X:%04X)".format(dev.vendorId, dev.productId),
-                matchedBoard = board,
-                hasPermission = usbManager.hasPermission(dev),
-                usbDevice = dev,
-            )
-        }
+        val list = usbManager.deviceList.values
+            .filter { dev -> isSerialCapableUsbDevice(dev) }
+            .map { dev ->
+                val board = HardwareRegistry.identifyByUsb(dev.vendorId, dev.productId, dev.productName)
+                val classes = (0 until dev.interfaceCount).map { idx -> dev.getInterface(idx).interfaceClass }
+                val bridge = identifyUsbSerialBridge(dev.vendorId, dev.productId, classes)
+                val safeSerial = runCatching {
+                    if (usbManager.hasPermission(dev)) dev.serialNumber else null
+                }.getOrNull()
+                DiscoveredUsbDevice(
+                    deviceName = dev.deviceName,
+                    vendorId = dev.vendorId,
+                    productId = dev.productId,
+                    productLabel = dev.productName ?: "${bridge.chipsetLabel} (%04X:%04X)".format(dev.vendorId, dev.productId),
+                    matchedBoard = board,
+                    hasPermission = usbManager.hasPermission(dev),
+                    usbDevice = dev,
+                    bridgeType = bridge,
+                    serialNumber = safeSerial,
+                )
+            }
         _usbDevices.value = list
+    }
+
+    private fun isSerialCapableUsbDevice(dev: UsbDevice): Boolean {
+        if (dev.vendorId in setOf(0x10C4, 0x1A86, 0x0403, 0x067B, 0x303A, 0x2341, 0x2A03, 0x2E8A)) {
+            return true
+        }
+        for (i in 0 until dev.interfaceCount) {
+            val intf = dev.getInterface(i)
+            val isCdc = intf.interfaceClass == UsbConstants.USB_CLASS_COMM ||
+                intf.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA
+            var hasBulkIn = false
+            var hasBulkOut = false
+            for (e in 0 until intf.endpointCount) {
+                val ep = intf.getEndpoint(e)
+                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    if (ep.direction == UsbConstants.USB_DIR_IN) hasBulkIn = true
+                    if (ep.direction == UsbConstants.USB_DIR_OUT) hasBulkOut = true
+                }
+            }
+            if (isCdc || (hasBulkIn && hasBulkOut)) return true
+        }
+        return false
     }
 
     fun requestUsbPermission(device: UsbDevice) {
@@ -483,6 +581,17 @@ class TransportManager(
                 val divisor = 3_000_000 / baudRate.coerceAtLeast(300)
                 conn.controlTransfer(0x40, 0x03, divisor, 0, null, 0, 500)
             }
+            0x067B -> { // Prolific PL2303
+                val lineCoding = byteArrayOf(
+                    (baudRate and 0xFF).toByte(),
+                    ((baudRate shr 8) and 0xFF).toByte(),
+                    ((baudRate shr 16) and 0xFF).toByte(),
+                    ((baudRate shr 24) and 0xFF).toByte(),
+                    0x00, 0x00, 0x08,
+                )
+                conn.controlTransfer(0x21, 0x20, 0, 0, lineCoding, 7, 500)
+                conn.controlTransfer(0x21, 0x22, 0x03, 0, null, 0, 500)
+            }
             else -> { // Standard USB CDC-ACM (Arduino / ESP32-S3/C3/C6 Native / RP2040)
                 conn.controlTransfer(0x21, 0x22, 0x03, 0, null, 0, 500) // SET_CONTROL_LINE_STATE DTR+RTS
                 val lineCoding = byteArrayOf(
@@ -514,6 +623,17 @@ class TransportManager(
                 conn.controlTransfer(0x21, 0x22, value, 0, null, 0, 200)
             }
         }
+    }
+
+    suspend fun pulseUsbBootloaderReset(): Boolean = withContext(Dispatchers.IO) {
+        if (usbConnection == null || activeUsbDevice == null) return@withContext false
+        setUsbControlLines(dtr = false, rts = true)
+        kotlinx.coroutines.delay(100)
+        setUsbControlLines(dtr = true, rts = false)
+        kotlinx.coroutines.delay(60)
+        setUsbControlLines(dtr = false, rts = false)
+        appendLog(LogDirection.SYS, "Pulsed DTR/RTS hardware bootloader reset sequence.")
+        true
     }
 
     fun setUsbBaudRate(baudRate: Int) {
@@ -1098,6 +1218,31 @@ class TransportManager(
                 hasNus -> "Nordic UART (NUS)"
                 hasHm10 -> "HM-10 BLE Serial"
                 else -> null
+            }
+        }
+
+        val SUPPORTED_USB_BAUD_RATES = listOf(9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1500000)
+
+        fun identifyUsbSerialBridge(
+            vendorId: Int,
+            productId: Int,
+            interfaceClasses: List<Int> = emptyList(),
+        ): UsbSerialBridgeType = when (vendorId) {
+            0x10C4 -> UsbSerialBridgeType.CP210X
+            0x1A86 -> UsbSerialBridgeType.CH340_CH9102
+            0x0403 -> UsbSerialBridgeType.FTDI
+            0x067B -> UsbSerialBridgeType.PL2303
+            0x303A -> UsbSerialBridgeType.ESPRESSIF_NATIVE_USB
+            0x2341, 0x2A03 -> UsbSerialBridgeType.ARDUINO_CDC
+            0x2E8A -> UsbSerialBridgeType.RP2040_RP2350
+            else -> {
+                if (interfaceClasses.contains(UsbConstants.USB_CLASS_COMM) ||
+                    interfaceClasses.contains(UsbConstants.USB_CLASS_CDC_DATA)
+                ) {
+                    UsbSerialBridgeType.CDC_ACM
+                } else {
+                    UsbSerialBridgeType.CDC_ACM
+                }
             }
         }
     }

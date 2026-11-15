@@ -1,8 +1,9 @@
 <resources>
     <string name="app_name">PocketBurner</string>
     <string name="nav_burner">Burner</string>
+    <string name="nav_launcher">Launcher</string>
     <string name="nav_connect">Connect</string>
-    <string name="nav_terminal">Terminal</string>
+    <string name="nav_terminal">Term</string>
     <string name="nav_nano">Nano</string>
     <string name="encryption_on">AES-256 + TLS ON</string>
     <string name="encryption_off">Plaintext</string>

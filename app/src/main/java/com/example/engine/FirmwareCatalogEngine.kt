@@ -90,12 +90,33 @@ class FirmwareCatalogEngine(
             lastError = null,
             itemCount = 0,
         ),
+        RepoSourceEntity(
+            id = "repo_bmorcelli_catalog",
+            name = "bmorcelli Full Firmware Catalog",
+            url = "https://raw.githubusercontent.com/bmorcelli/M5Stack-json-fw/main/script/all_device_firmware.json",
+            parserType = RepoParserType.M5BURNER.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_bmorcelli_launcher",
+            name = "M5Launcher (bmorcelli/Launcher)",
+            url = "https://api.github.com/repos/bmorcelli/Launcher/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
     )
 
     suspend fun ensureDefaultReposSeeded() = withContext(Dispatchers.IO) {
-        val existing = repoDao.getEnabled()
-        if (existing.isEmpty()) {
-            repoDao.upsertAll(defaultRepositories)
+        val existingIds = repoDao.getEnabled().map { it.id }.toSet()
+        val missing = defaultRepositories.filter { it.id !in existingIds }
+        if (missing.isNotEmpty()) {
+            repoDao.upsertAll(missing)
         }
     }
 
@@ -358,6 +379,47 @@ class FirmwareCatalogEngine(
         entity
     }
 
+    suspend fun importAndDownloadWebBinary(
+        downloadUrl: String,
+        suggestedFileName: String?,
+        targetDeviceId: String,
+    ): Result<FirmwareEntity> = withContext(Dispatchers.IO) {
+        val cleanName = (suggestedFileName?.takeIf { it.isNotBlank() }
+            ?: downloadUrl.substringBefore("?").substringAfterLast("/").ifBlank { "launcher_firmware.bin" })
+        val ext = cleanName.substringAfterLast(".", "bin").lowercase()
+        val board = HardwareRegistry.findById(targetDeviceId)
+            ?: HardwareRegistry.boards.first()
+        val item = FirmwareEntity(
+            id = "web_fw_${UUID.randomUUID().toString().take(8)}",
+            title = cleanName.substringBeforeLast("."),
+            author = "Launcher Web Portal",
+            category = FirmwareCategory.UI_LAUNCHER.label,
+            deviceTagsCsv = board.id,
+            family = board.family.name,
+            version = "web",
+            availableVersionsCsv = "web",
+            framework = "M5Launcher / Web Binary",
+            description = "Downloaded via PocketLauncher Web Portal ($cleanName).",
+            coverImageUrl = null,
+            downloadUrl = downloadUrl,
+            localFilePath = null,
+            fileExtension = ext,
+            sizeBytes = 0L,
+            sha256 = null,
+            flashOffset = board.appOffset,
+            defaultBaud = board.defaultBaud,
+            flashMode = board.flashMode,
+            repoSourceId = "launcher_web",
+            isCustomUserAdded = true,
+            downloadState = DownloadState.NOT_DOWNLOADED.name,
+            downloadProgress = 0,
+            updatedAt = System.currentTimeMillis(),
+        )
+        firmwareDao.upsert(item)
+        taxonomyRepository.linkFirmwareBatch(listOf(item))
+        downloadFirmwareOnDemand(item)
+    }
+
     suspend fun downloadFirmwareOnDemand(
         item: FirmwareEntity,
         onProgress: (Int, Long, Long) -> Unit = { _, _, _ -> },
@@ -435,7 +497,7 @@ class FirmwareCatalogEngine(
         }
     }
 
-    private fun parseM5BurnerFeed(json: String, repoId: String): List<FirmwareEntity> {
+    internal fun parseM5BurnerFeed(json: String, repoId: String): List<FirmwareEntity> {
         val array = when {
             json.trim().startsWith("[") -> JSONArray(json)
             else -> {
@@ -444,6 +506,7 @@ class FirmwareCatalogEngine(
                     ?: root.optJSONArray("firmwares")
                     ?: root.optJSONArray("list")
                     ?: root.optJSONArray("items")
+                    ?: flattenCategoryObjectArrays(root)
                     ?: JSONArray().apply { put(root) }
             }
         }
@@ -451,39 +514,95 @@ class FirmwareCatalogEngine(
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: continue
             val name = obj.optString("name").ifBlank { obj.optString("title", "Firmware #$i") }
-            val author = obj.optString("author", "M5Stack Community")
+            val author = obj.optString("author").ifBlank { obj.optString("published_by", "M5Stack Community") }
             val category = FirmwareCategory.fromString(
                 obj.optString("category").ifBlank { obj.optString("firmware_category") }
             ).label
+
             val devicesList = mutableListOf<String>()
-            obj.optJSONArray("device")?.let { arr ->
-                for (j in 0 until arr.length()) devicesList.add(arr.optString(j))
+            listOf("device", "devices", "board", "boards", "target", "targets").forEach { key ->
+                obj.optJSONArray(key)?.let { arr ->
+                    for (j in 0 until arr.length()) {
+                        normalizeBoardTag(arr.optString(j))?.let { devicesList.add(it) }
+                    }
+                }
+                val singleVal = obj.optString(key)
+                if (singleVal.isNotBlank() && !singleVal.startsWith("[") && !singleVal.startsWith("{")) {
+                    singleVal.split(",", "/", "|").forEach { part ->
+                        normalizeBoardTag(part)?.let { devicesList.add(it) }
+                    }
+                }
             }
-            obj.optJSONArray("devices")?.let { arr ->
-                for (j in 0 until arr.length()) devicesList.add(arr.optString(j))
+            if (devicesList.isEmpty()) {
+                devicesList.addAll(inferDevicesFromAssetName(name.lowercase()))
             }
-            val singleDev = obj.optString("device").takeIf { it.isNotBlank() && !it.startsWith("[") }
-            if (singleDev != null) devicesList.add(singleDev)
-            val deviceCsv = devicesList.filter { it.isNotBlank() }.ifEmpty { listOf("Core2", "CoreS3") }.joinToString(",")
+            val deviceCsv = devicesList.distinct().joinToString(",")
 
             val versions = mutableListOf<String>()
+            var versionDownloadUrl = ""
+            var versionFileOffset = ""
             obj.optJSONArray("versions")?.let { arr ->
                 for (j in 0 until arr.length()) {
                     val vObj = arr.optJSONObject(j)
-                    versions.add(vObj?.optString("version") ?: arr.optString(j))
+                    if (vObj != null) {
+                        val ver = vObj.optString("version").ifBlank { vObj.optString("ver") }
+                        if (ver.isNotBlank()) versions.add(ver)
+                        if (versionDownloadUrl.isBlank()) {
+                            versionDownloadUrl = vObj.optString("download_url")
+                                .ifBlank { vObj.optString("url") }
+                                .ifBlank { vObj.optString("file") }
+                        }
+                        if (versionFileOffset.isBlank()) {
+                            versionFileOffset = vObj.optString("offset").ifBlank { vObj.optString("address") }
+                        }
+                    } else {
+                        val s = arr.optString(j)
+                        if (s.isNotBlank()) versions.add(s)
+                    }
                 }
             }
             val primaryVersion = obj.optString("version").ifBlank { versions.firstOrNull() ?: "1.0.0" }
             val versionsCsv = versions.ifEmpty { listOf(primaryVersion) }.joinToString(",")
-            val downloadUrl = obj.optString("download_url")
+
+            var firstFileOffset = versionFileOffset
+            var firstFilePath = ""
+            obj.optJSONArray("files")?.let { filesArr ->
+                for (f in 0 until filesArr.length()) {
+                    val fObj = filesArr.optJSONObject(f) ?: continue
+                    val path = fObj.optString("path").ifBlank { fObj.optString("filename") }
+                    val addr = fObj.optString("address").ifBlank { fObj.optString("offset") }
+                    if (firstFilePath.isBlank() && path.isNotBlank()) {
+                        firstFilePath = path
+                        firstFileOffset = addr.ifBlank { firstFileOffset }
+                    }
+                    if (addr.equals("0x10000", ignoreCase = true) || addr.equals("0x0", ignoreCase = true) || addr.equals("0x0000", ignoreCase = true)) {
+                        firstFilePath = path.ifBlank { firstFilePath }
+                        firstFileOffset = addr
+                    }
+                }
+            }
+
+            val rawDownloadUrl = obj.optString("download_url")
                 .ifBlank { obj.optString("url") }
                 .ifBlank { obj.optString("bin_url") }
-            if (downloadUrl.isBlank()) continue
+                .ifBlank { obj.optString("file") }
+                .ifBlank { versionDownloadUrl }
+                .ifBlank { firstFilePath }
+            if (rawDownloadUrl.isBlank()) continue
+            val downloadUrl = if (rawDownloadUrl.startsWith("http://") || rawDownloadUrl.startsWith("https://")) {
+                rawDownloadUrl
+            } else {
+                "https://m5burner-cdn.m5stack.com/firmware/${rawDownloadUrl.trimStart('/')}"
+            }
 
-            val coverUrl = obj.optString("cover")
+            val rawCoverUrl = obj.optString("cover")
                 .ifBlank { obj.optString("cover_image") }
                 .ifBlank { obj.optString("image") }
                 .takeIf { it.isNotBlank() }
+            val coverUrl = rawCoverUrl?.let {
+                if (it.startsWith("http://") || it.startsWith("https://")) it
+                else "https://m5burner-cdn.m5stack.com/cover/${it.trimStart('/')}"
+            }
 
             val firstBoard = HardwareRegistry.findById(deviceCsv.substringBefore(",").trim())
             items.add(
@@ -497,14 +616,14 @@ class FirmwareCatalogEngine(
                     version = primaryVersion,
                     availableVersionsCsv = versionsCsv,
                     framework = obj.optString("framework").ifBlank { "ESP-IDF / Arduino" },
-                    description = obj.optString("description").ifBlank { "M5Burner firmware package." },
+                    description = obj.optString("description").ifBlank { "M5Burner / bmorcelli community firmware package." },
                     coverImageUrl = coverUrl,
                     downloadUrl = downloadUrl,
                     localFilePath = null,
                     fileExtension = downloadUrl.substringBefore("?").substringAfterLast(".", "bin"),
                     sizeBytes = obj.optLong("size", 0L),
                     sha256 = obj.optString("sha256").takeIf { it.isNotBlank() },
-                    flashOffset = obj.optString("offset").ifBlank { firstBoard?.appOffset ?: "0x0000" },
+                    flashOffset = obj.optString("offset").ifBlank { firstFileOffset }.ifBlank { firstBoard?.appOffset ?: "0x0000" },
                     defaultBaud = obj.optInt("default_baud", firstBoard?.defaultBaud ?: 921600),
                     flashMode = obj.optString("flash_mode").ifBlank { firstBoard?.flashMode ?: "DIO" },
                     repoSourceId = repoId,
@@ -516,6 +635,31 @@ class FirmwareCatalogEngine(
             )
         }
         return items
+    }
+
+    private fun flattenCategoryObjectArrays(root: JSONObject): JSONArray? {
+        val merged = JSONArray()
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val arr = root.optJSONArray(k) ?: continue
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                if (!obj.has("category") && k.isNotBlank()) {
+                    obj.put("category", k)
+                }
+                merged.put(obj)
+            }
+        }
+        return merged.takeIf { it.length() > 0 }
+    }
+
+    private fun normalizeBoardTag(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank() || trimmed == "null") return null
+        HardwareRegistry.findById(trimmed)?.let { return it.id }
+        val lower = trimmed.lowercase()
+        return inferDevicesFromAssetName(lower).firstOrNull() ?: trimmed
     }
 
     private fun parseRpiImagerFeed(json: String, repoId: String): List<FirmwareEntity> {
@@ -590,7 +734,7 @@ class FirmwareCatalogEngine(
         return result
     }
 
-    private fun parseGitHubReleaseFeed(json: String, repoId: String, repoName: String): List<FirmwareEntity> {
+    internal fun parseGitHubReleaseFeed(json: String, repoId: String, repoName: String): List<FirmwareEntity> {
         val root = JSONObject(json)
         val tag = root.optString("tag_name", "latest")
         val body = root.optString("body", "").lineSequence().take(3).joinToString(" ").take(220)
@@ -611,6 +755,7 @@ class FirmwareCatalogEngine(
             val inferredDevices = inferDevicesFromAssetName(lower)
             val firstBoard = HardwareRegistry.findById(inferredDevices.firstOrNull() ?: "ESP32 DevKit")
             val category = when {
+                lower.contains("launcher") || repoId.contains("bmorcelli") -> FirmwareCategory.UI_LAUNCHER.label
                 lower.contains("tasmota") -> FirmwareCategory.IOT_AUTOMATION.label
                 lower.contains("micropython") -> FirmwareCategory.DEVELOPMENT_LEARNING.label
                 else -> FirmwareCategory.TOOLS.label
@@ -644,7 +789,6 @@ class FirmwareCatalogEngine(
                     updatedAt = System.currentTimeMillis(),
                 )
             )
-            if (result.size >= 35) break
         }
         return result
     }
@@ -714,7 +858,6 @@ class FirmwareCatalogEngine(
                         updatedAt = System.currentTimeMillis(),
                     )
                 )
-                if (result.size >= 15) break
             }
         }
         return result
@@ -730,7 +873,52 @@ class FirmwareCatalogEngine(
         }
     }
 
-    private fun inferDevicesFromAssetName(lower: String): List<String> = when {
+    internal fun inferDevicesFromAssetName(lower: String): List<String> = when {
+        lower.contains("cardputer-adv") || lower.contains("cardputer_adv") || lower.contains("cardputer adv") -> listOf("Cardputer ADV", "Cardputer")
+        lower.contains("cardputer") -> listOf("Cardputer", "Cardputer ADV")
+        lower.contains("stickc-plus2") || lower.contains("stickcplus2") || lower.contains("stickc_plus2") || lower.contains("plus2") -> listOf("StickC-Plus2")
+        lower.contains("stickc-plus") || lower.contains("stickcplus") || lower.contains("stickc_plus") -> listOf("StickC-Plus")
+        lower.contains("sticks3") -> listOf("StickS3")
+        lower.contains("stickt2") -> listOf("StickT2")
+        lower.contains("stickc") -> listOf("StickC", "StickC-Plus", "StickC-Plus2")
+        lower.contains("cores3") -> listOf("CoreS3")
+        lower.contains("core2") -> listOf("Core2")
+        lower.contains("coreink") -> listOf("CoreInk")
+        lower.contains("corep4") -> listOf("CoreP4X")
+        lower.contains("corematrix") -> listOf("CoreMatrix")
+        lower.contains("m5go") -> listOf("M5GO", "Core Series")
+        lower.contains("fire") -> listOf("Fire", "Core Series")
+        lower.contains("toughc5") -> listOf("ToughC5")
+        lower.contains("tough") -> listOf("Tough", "Core2")
+        lower.contains("dial") -> listOf("Dial")
+        lower.contains("dinmeter") -> listOf("DinMeter")
+        lower.contains("papers3") -> listOf("PaperS3", "Paper")
+        lower.contains("papercolor") -> listOf("PaperColor", "Paper")
+        lower.contains("papermono") -> listOf("PaperMono", "Paper")
+        lower.contains("paperdiy") -> listOf("PaperDIY", "Paper")
+        lower.contains("paper") -> listOf("Paper", "PaperS3")
+        lower.contains("atoms3r") -> listOf("AtomS3R", "AtomS3")
+        lower.contains("atoms3-lite") || lower.contains("atoms3lite") -> listOf("AtomS3-Lite", "AtomS3")
+        lower.contains("atoms3") -> listOf("AtomS3", "Atom Series")
+        lower.contains("atom-matrix") || lower.contains("atommatrix") -> listOf("Atom-Matrix", "Atom Series")
+        lower.contains("atom-lite") || lower.contains("atomlite") -> listOf("Atom-Lite", "Atom Series")
+        lower.contains("nanoc6") -> listOf("NanoC6", "ESP32-C6")
+        lower.contains("nanoh2") -> listOf("NanoH2", "ESP32-H2")
+        lower.contains("stamp-s3") || lower.contains("stamps3") -> listOf("Stamp-S3", "Stamp Series")
+        lower.contains("stamp-c3") || lower.contains("stampc3") -> listOf("Stamp-C3", "Stamp Series")
+        lower.contains("stamp-c5") || lower.contains("stampc5") -> listOf("Stamp-C5", "Stamp Series")
+        lower.contains("stamp-c6") || lower.contains("stampc6") -> listOf("Stamp-C6LoRa", "Stamp Series")
+        lower.contains("stamp-p4") || lower.contains("stampp4") -> listOf("Stamp-P4", "Stamp Series")
+        lower.contains("stamp-pico") || lower.contains("stamppico") -> listOf("Stamp-Pico", "Stamp Series")
+        lower.contains("capsule") -> listOf("Capsule")
+        lower.contains("stackchan") -> listOf("StackChan")
+        lower.contains("timercam") -> listOf("TimerCam")
+        lower.contains("tab5") -> listOf("Tab5")
+        lower.contains("station") -> listOf("Station")
+        lower.contains("powerhub") -> listOf("PowerHub")
+        lower.contains("vameter") -> listOf("VAMeter")
+        lower.contains("xiaozhi") -> listOf("Xiaozhi Card Kit")
+        lower.contains("nesso") -> listOf("Arduino Nesso N1")
         lower.contains("esp32s3") || lower.contains("esp32-s3") -> listOf("ESP32-S3", "CoreS3", "Cardputer", "AtomS3")
         lower.contains("esp32s2") || lower.contains("esp32-s2") -> listOf("ESP32-S2")
         lower.contains("esp32c6") || lower.contains("esp32-c6") -> listOf("ESP32-C6", "NanoC6", "Unit C6L")
@@ -741,7 +929,7 @@ class FirmwareCatalogEngine(
         lower.contains("esp8266") || lower.contains("tasmota.bin") -> listOf("ESP8266")
         lower.contains("rp2040") || lower.contains("pico_w") || lower.contains("pico-") -> listOf("Raspberry Pi Pico")
         lower.contains("rp2350") || lower.contains("pico2") -> listOf("Raspberry Pi Pico 2")
-        lower.contains("m5stack") || lower.contains("core2") -> listOf("Core2", "Core Series")
+        lower.contains("m5stack") || lower.contains("m5core") || lower.contains("core-s") -> listOf("Core Series", "Core2", "CoreS3")
         else -> listOf("ESP32 DevKit", "Core2", "StickC-Plus2")
     }
 
