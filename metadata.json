@@ -1,0 +1,6 @@
+{
+  "name": "PocketBurner",
+  "description": "Android hardware firmware burner, multi-transport IoT terminal (BLE, Wi-Fi/TLS, USB OTG) with AES-256-GCM encryption, and nano-style multi-language script studio for all ESP, M5Stack, Arduino, and Raspberry Pi devices.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
