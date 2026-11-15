@@ -37,6 +37,13 @@ enum class CatalogSection(val label: String) {
     VERIFICATION("Verification"),
 }
 
+enum class DownloadSortOrder(val label: String) {
+    MOST_DOWNLOADED("Most Downloaded -> Low"),
+    LOW_DOWNLOADED("Low -> High Downloads"),
+    RECENT("Recent"),
+    TITLE_ASC("A-Z"),
+}
+
 @Entity(tableName = "categories")
 data class CategoryEntity(
     @PrimaryKey val id: String,
@@ -128,6 +135,8 @@ data class FirmwareEntity(
     val sourceType: String = "community",
     val releaseDate: String = "",
     val sourceUrl: String = "",
+    val downloadCount: Long = 0L,
+    val userNote: String = "",
 )
 
 @Entity(

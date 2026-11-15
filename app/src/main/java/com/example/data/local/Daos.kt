@@ -89,6 +89,12 @@ interface FirmwareDao {
     @Query("UPDATE firmware_items SET downloadState = :state, downloadProgress = :progress, localFilePath = :localPath WHERE id = :id")
     suspend fun updateDownloadStatus(id: String, state: String, progress: Int, localPath: String?)
 
+    @Query("UPDATE firmware_items SET userNote = :note, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateUserNote(id: String, note: String, updatedAt: Long = System.currentTimeMillis())
+
+    @Query("UPDATE firmware_items SET downloadCount = downloadCount + 1, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun incrementDownloadCount(id: String, updatedAt: Long = System.currentTimeMillis())
+
     @Query("DELETE FROM firmware_items WHERE repoSourceId = :repoId AND isCustomUserAdded = 0 AND downloadState != 'DOWNLOADED'")
     suspend fun clearRemoteByRepo(repoId: String)
 

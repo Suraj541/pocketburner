@@ -339,39 +339,7 @@ class PocketBurnerUnitTest {
     }
 
     @Test
-    fun launcherBridgeTrustAndBinaryDetection_validatesOriginsAndFirmwareUrls() {
-        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://web.esphome.io/"))
-        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("http://192.168.4.1/"))
-        assertTrue(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://bmorcelli.github.io/Launcher/"))
-        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("file:///android_asset/launcher_webui.html"))
-        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("http://launcher.local/update"))
-        assertFalse(com.example.ui.launcher.LauncherViewModel.isTrustedBridgeOrigin("https://untrusted-site.example.com/"))
-
-        assertTrue(
-            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
-                "https://github.com/bmorcelli/Launcher/releases/download/2.5.0/Launcher-m5stack-cardputer.bin",
-                null,
-                null,
-            )
-        )
-        assertTrue(
-            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
-                "https://example.org/pico.uf2",
-                null,
-                "application/octet-stream",
-            )
-        )
-        assertFalse(
-            com.example.ui.launcher.LauncherViewModel.isBinaryFirmwareUrl(
-                "https://github.com/bmorcelli/Launcher",
-                null,
-                "text/html",
-            )
-        )
-    }
-
-    @Test
-    fun wifiOtaConfig_buildsCleanHttpHttpsUrlsAndParsesLauncherTargets() {
+    fun wifiOtaConfig_buildsCleanHttpHttpsUrls() {
         val httpDefault = com.example.engine.WifiOtaTargetConfig(
             useHttps = false,
             host = "http://192.168.4.1/",
@@ -387,24 +355,6 @@ class PocketBurnerUnitTest {
             endpointPath = "/ota/upload",
         )
         assertEquals("https://esp32-ota.local:8443/ota/upload", httpsCustom.buildTargetUrl())
-
-        val fallbackParsed = com.example.ui.launcher.LauncherViewModel.parseTargetConfig(
-            rawUrl = "file:///android_asset/launcher_webui.html",
-            protocol = com.example.engine.OtaUploadProtocol.ESP_MULTIPART_UPDATE,
-            fallbackHost = "192.168.1.55",
-        )
-        assertEquals("192.168.1.55", fallbackParsed.host)
-        assertEquals("/update", fallbackParsed.endpointPath)
-        assertFalse(fallbackParsed.useHttps)
-
-        val directHttpsParsed = com.example.ui.launcher.LauncherViewModel.parseTargetConfig(
-            rawUrl = "https://192.168.1.88:8443/upload",
-            protocol = com.example.engine.OtaUploadProtocol.LAUNCHER_SD_UPLOAD,
-        )
-        assertTrue(directHttpsParsed.useHttps)
-        assertEquals("192.168.1.88", directHttpsParsed.host)
-        assertEquals(8443, directHttpsParsed.port)
-        assertEquals("/upload", directHttpsParsed.endpointPath)
     }
 
     @Test
@@ -875,5 +825,94 @@ class PocketBurnerUnitTest {
         )
         assertEquals(badCpp, highlighted.text)
         assertTrue(highlighted.spanStyles.isNotEmpty())
+    }
+
+    @Test
+    fun batteryTelemetryParser_extractsVoltagePercentageChargingAndBrownoutStates() {
+        val brownout = TransportManager.parseBatteryTelemetryLine("PWR VBAT=3.32V", "USB OTG")
+        assertNotNull(brownout)
+        assertEquals(3.32, brownout!!.voltageVolts!!, 0.001)
+        assertEquals(3320, brownout.millivolts)
+        assertEquals(com.example.engine.BatteryHealthStatus.CRITICAL_BROWNOUT, brownout.status)
+
+        val lowWarn = TransportManager.parseBatteryTelemetryLine("Battery: 3580 mV (18%)", "BLE GATT")
+        assertNotNull(lowWarn)
+        assertEquals(3.58, lowWarn!!.voltageVolts!!, 0.001)
+        assertEquals(18, lowWarn.percentage)
+        assertEquals(com.example.engine.BatteryHealthStatus.LOW_WARNING, lowWarn.status)
+
+        val atCbc = TransportManager.parseBatteryTelemetryLine("+CBC: 1,88,4120", "USB OTG")
+        assertNotNull(atCbc)
+        assertEquals(4.12, atCbc!!.voltageVolts!!, 0.001)
+        assertEquals(88, atCbc.percentage)
+        assertEquals(true, atCbc.isCharging)
+        assertEquals(com.example.engine.BatteryHealthStatus.SAFE, atCbc.status)
+
+        val jsonTelemetry = TransportManager.parseBatteryTelemetryLine("""{"battery_mv":3950,"pct":82}""", "Wi-Fi TCP")
+        assertNotNull(jsonTelemetry)
+        assertEquals(3.95, jsonTelemetry!!.voltageVolts!!, 0.001)
+        assertEquals(82, jsonTelemetry.percentage)
+        assertEquals(com.example.engine.BatteryHealthStatus.SAFE, jsonTelemetry.status)
+
+        val usbRail = TransportManager.parseBatteryTelemetryLine("VBUS 5.02V OK", "USB OTG")
+        assertNotNull(usbRail)
+        assertEquals(com.example.engine.BatteryHealthStatus.SAFE, usbRail!!.status)
+
+        val noise = TransportManager.parseBatteryTelemetryLine("WiFi connected IP 192.168.4.1 RSSI -42", "Wi-Fi TCP")
+        assertNull(noise)
+    }
+
+    @Test
+    fun firmwareNotesAndDownloadSorting_parsesCountsSortsDescendingAndPersistsNotes() = kotlinx.coroutines.test.runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val container = AppContainer.getInstance(context)
+        val engine = container.firmwareCatalogEngine
+
+        val m5Feed = """
+            [
+              {
+                "fid": "fw_low",
+                "name": "Minimal Beacon",
+                "author": "DevA",
+                "downloads": 42,
+                "note": "Hold GPIO0 on boot",
+                "files": [{"address": "0x10000", "path": "beacon.bin"}]
+              },
+              {
+                "fid": "fw_high",
+                "name": "Popular Marauder",
+                "author": "DevB",
+                "download_count": 15420,
+                "files": [{"address": "0x10000", "path": "marauder.bin"}]
+              }
+            ]
+        """.trimIndent()
+        val parsedM5 = engine.parseM5BurnerFeed(m5Feed, "repo_m5burner")
+        assertEquals(2, parsedM5.size)
+        assertEquals(42L, parsedM5[0].downloadCount)
+        assertEquals("Hold GPIO0 on boot", parsedM5[0].userNote)
+        assertEquals(15420L, parsedM5[1].downloadCount)
+
+        val sortedHighToLow = com.example.engine.FirmwareCatalogEngine.sortFirmwareList(
+            parsedM5,
+            com.example.data.local.DownloadSortOrder.MOST_DOWNLOADED,
+        )
+        assertEquals(listOf("Popular Marauder", "Minimal Beacon"), sortedHighToLow.map { it.title })
+
+        val sortedLowToHigh = com.example.engine.FirmwareCatalogEngine.sortFirmwareList(
+            parsedM5,
+            com.example.data.local.DownloadSortOrder.LOW_DOWNLOADED,
+        )
+        assertEquals(listOf("Minimal Beacon", "Popular Marauder"), sortedLowToHigh.map { it.title })
+        assertEquals("15.4K", com.example.engine.FirmwareCatalogEngine.formatDownloadCount(15420))
+
+        container.database.firmwareDao().upsertAll(parsedM5)
+        engine.updateFirmwareNote("repo_m5burner_fw_high", "Requires 921600 baud + PSRAM")
+        val updated = container.database.firmwareDao().getById("repo_m5burner_fw_high")
+        assertEquals("Requires 921600 baud + PSRAM", updated?.userNote)
+
+        container.database.firmwareDao().incrementDownloadCount("repo_m5burner_fw_low")
+        val incremented = container.database.firmwareDao().getById("repo_m5burner_fw_low")
+        assertEquals(43L, incremented?.downloadCount)
     }
 }

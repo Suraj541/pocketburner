@@ -8,12 +8,15 @@ import com.example.AppContainer
 import com.example.data.local.CatalogSection
 import com.example.data.local.CategoryEntity
 import com.example.data.local.DeviceSeriesWithDevices
+import com.example.data.local.DownloadSortOrder
 import com.example.data.local.DownloadState
 import com.example.data.local.FirmwareEntity
 import com.example.data.local.RepoParserType
 import com.example.data.local.RepoSourceEntity
 import com.example.engine.ActiveConnection
+import com.example.engine.FirmwareCatalogEngine
 import com.example.engine.FlashOptions
+import com.example.engine.HardwareBatteryTelemetry
 import com.example.engine.IntegrityVerificationReport
 import com.example.hardware.DeviceFamily
 import com.example.hardware.FirmwareCategory
@@ -74,6 +77,9 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
+    private val _sortOrder = MutableStateFlow(DownloadSortOrder.MOST_DOWNLOADED)
+    val sortOrder: StateFlow<DownloadSortOrder> = _sortOrder.asStateFlow()
+
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
@@ -84,6 +90,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
     val flashSession: StateFlow<FlashSessionState> = _flashSession.asStateFlow()
 
     val connectionState: StateFlow<ActiveConnection> = container.transportManager.connectionState
+    val batteryTelemetry: StateFlow<HardwareBatteryTelemetry> = container.transportManager.batteryTelemetry
 
     val repos: StateFlow<List<RepoSourceEntity>> = repoDao.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -131,9 +138,12 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
                 item.author.lowercase().contains(q) ||
                 item.vendor.lowercase().contains(q) ||
                 item.description.lowercase().contains(q) ||
+                item.userNote.lowercase().contains(q) ||
                 item.deviceTagsCsv.lowercase().contains(q) ||
                 item.framework.lowercase().contains(q)
         }
+    }.combine(_sortOrder) { items, sort ->
+        FirmwareCatalogEngine.sortFirmwareList(items, sort)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
@@ -167,6 +177,25 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setSearchQuery(q: String) {
         _searchQuery.value = q
+    }
+
+    fun setSortOrder(order: DownloadSortOrder) {
+        _sortOrder.value = order
+    }
+
+    fun updateFirmwareNote(firmwareId: String, note: String) {
+        viewModelScope.launch {
+            catalog.updateFirmwareNote(firmwareId, note)
+        }
+    }
+
+    fun probeHardwareBattery() {
+        viewModelScope.launch {
+            val res = container.transportManager.probeHardwareBattery()
+            res.exceptionOrNull()?.let { err ->
+                _syncMessage.value = err.message
+            }
+        }
     }
 
     fun clearSyncMessage() {
@@ -240,6 +269,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
         baudRate: Int,
         sha256: String?,
         description: String,
+        userNote: String = "",
     ) {
         viewModelScope.launch {
             catalog.addCustomUrlFirmware(
@@ -254,6 +284,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
                 baudRate = baudRate,
                 sha256 = sha256,
                 description = description,
+                userNote = userNote,
             )
             _syncMessage.value = "Added custom firmware '$title'. Tap Download when ready to flash."
         }
@@ -269,6 +300,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
         flashOffset: String,
         baudRate: Int,
         description: String,
+        userNote: String = "",
     ) {
         viewModelScope.launch {
             val res = catalog.addCustomLocalFirmware(
@@ -281,6 +313,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
                 flashOffset = flashOffset,
                 baudRate = baudRate,
                 description = description,
+                userNote = userNote,
             )
             _syncMessage.value = res.fold(
                 onSuccess = { "Imported '${it.title}' (${it.sizeBytes / 1024} KB)." },

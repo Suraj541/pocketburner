@@ -12,6 +12,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.AppContainer
 import com.example.data.local.ConnectionProfileEntity
+import com.example.data.local.DownloadSortOrder
 import com.example.data.local.DownloadState
 import com.example.data.local.FirmwareEntity
 import com.example.data.local.SecurityAndTransportSettings
@@ -21,7 +22,9 @@ import com.example.engine.BleConnectionService
 import com.example.engine.DiscoveredBleDevice
 import com.example.engine.DiscoveredNetworkEndpoint
 import com.example.engine.DiscoveredUsbDevice
+import com.example.engine.FirmwareCatalogEngine
 import com.example.engine.FlashOptions
+import com.example.engine.HardwareBatteryTelemetry
 import com.example.engine.TransportManager
 import com.example.engine.UsbFlashProgressState
 import com.example.engine.UsbOtgManagerService
@@ -65,14 +68,21 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
     val networkEndpoints: StateFlow<List<DiscoveredNetworkEndpoint>> = transport.networkEndpoints
     val isNsdScanning: StateFlow<Boolean> = transport.isNsdScanning
 
-    val readyBinaries: StateFlow<List<FirmwareEntity>> = firmwareDao.observeAll()
-        .map { list ->
-            list.filter {
-                it.downloadState == DownloadState.DOWNLOADED.name &&
-                    !it.localFilePath.isNullOrBlank()
-            }
+    val batteryTelemetry: StateFlow<HardwareBatteryTelemetry> = transport.batteryTelemetry
+
+    private val _binarySortOrder = MutableStateFlow(DownloadSortOrder.MOST_DOWNLOADED)
+    val binarySortOrder: StateFlow<DownloadSortOrder> = _binarySortOrder.asStateFlow()
+
+    val readyBinaries: StateFlow<List<FirmwareEntity>> = combine(
+        firmwareDao.observeAll(),
+        _binarySortOrder,
+    ) { list, sort ->
+        val ready = list.filter {
+            it.downloadState == DownloadState.DOWNLOADED.name &&
+                !it.localFilePath.isNullOrBlank()
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        FirmwareCatalogEngine.sortFirmwareList(ready, sort)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _bleSearchQuery = MutableStateFlow("")
     val bleSearchQuery: StateFlow<String> = _bleSearchQuery.asStateFlow()
@@ -193,6 +203,25 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun hasBlePermissions(): Boolean = transport.hasBlePermissions()
+
+    fun setBinarySortOrder(order: DownloadSortOrder) {
+        _binarySortOrder.value = order
+    }
+
+    fun updateFirmwareNote(firmwareId: String, note: String) {
+        viewModelScope.launch {
+            catalogEngine.updateFirmwareNote(firmwareId, note)
+        }
+    }
+
+    fun probeHardwareBattery() {
+        viewModelScope.launch {
+            val res = transport.probeHardwareBattery()
+            res.exceptionOrNull()?.let { err ->
+                _statusBanner.value = err.message
+            }
+        }
+    }
 
     // ==================== USB OTG MANAGER SERVICE ACTIONS ====================
     fun refreshUsb() {

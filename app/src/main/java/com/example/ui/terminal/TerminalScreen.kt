@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.engine.LogDirection
 import com.example.ui.components.ConnectionStatusPill
+import com.example.ui.components.DeviceBatteryMonitorCard
 import com.example.ui.components.EncryptionTogglePill
 import com.example.ui.theme.LocalHardwareStatusColors
 import com.example.ui.theme.MonoTextStyles
@@ -66,6 +67,7 @@ fun TerminalScreen(
 ) {
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    val batteryTelemetry by viewModel.batteryTelemetry.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val history by viewModel.commandHistory.collectAsStateWithLifecycle()
     val lineEnding by viewModel.lineEnding.collectAsStateWithLifecycle()
@@ -111,6 +113,14 @@ fun TerminalScreen(
                 }
             }
         }
+
+        DeviceBatteryMonitorCard(
+            telemetry = batteryTelemetry,
+            connectionState = connectionState,
+            compact = true,
+            onProbeBattery = viewModel::probeHardwareBattery,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+        )
 
         // Quick Task Macros + Nano CLI shortcut
         LazyRow(

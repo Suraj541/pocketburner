@@ -15,28 +15,44 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.BatteryUnknown
+import androidx.compose.material.icons.filled.Battery3Bar
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Usb
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.LinkOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -45,13 +61,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.data.local.DownloadSortOrder
+import com.example.data.local.FirmwareEntity
 import com.example.engine.ActiveConnection
+import com.example.engine.BatteryHealthStatus
+import com.example.engine.HardwareBatteryTelemetry
 import com.example.hardware.DeviceFamily
 import com.example.hardware.HardwareBoardSpec
 import com.example.hardware.HardwareRegistry
@@ -364,3 +385,256 @@ private fun SpecRow(label: String, value: String) {
         )
     }
 }
+
+@Composable
+fun DeviceBatteryMonitorCard(
+    telemetry: HardwareBatteryTelemetry,
+    connectionState: ActiveConnection,
+    compact: Boolean = false,
+    onProbeBattery: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
+    val statusColors = LocalHardwareStatusColors.current
+    val isConnected = connectionState !is ActiveConnection.Disconnected
+    val (tint, containerColor, icon) = when {
+        telemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT -> Triple(
+            MaterialTheme.colorScheme.error,
+            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
+            Icons.Filled.BatteryAlert,
+        )
+        telemetry.status == BatteryHealthStatus.LOW_WARNING -> Triple(
+            Color(0xFFF59E0B),
+            Color(0xFFF59E0B).copy(alpha = 0.14f),
+            Icons.Filled.Battery3Bar,
+        )
+        telemetry.status == BatteryHealthStatus.SAFE -> Triple(
+            statusColors.connected,
+            statusColors.connected.copy(alpha = 0.12f),
+            if (telemetry.isCharging == true) Icons.Filled.BatteryChargingFull else Icons.Filled.BatteryFull,
+        )
+        else -> Triple(
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.50f),
+            Icons.AutoMirrored.Filled.BatteryUnknown,
+        )
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = containerColor,
+        border = BorderStroke(1.dp, tint.copy(alpha = 0.45f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("device_battery_monitor_card"),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = if (compact) 8.dp else 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = "Device battery status: ${telemetry.status.label}",
+                        tint = tint,
+                        modifier = Modifier.size(if (compact) 18.dp else 22.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        val headline = if (telemetry.hasReading) {
+                            buildString {
+                                append("Target Power: ")
+                                append(telemetry.formattedVoltage())
+                                telemetry.percentage?.let { append(" • $it%") }
+                                if (telemetry.isCharging == true) append(" (CHG)")
+                            }
+                        } else if (isConnected) {
+                            "Target Battery: Awaiting VBAT telemetry"
+                        } else {
+                            "Target Battery Monitor (Offline)"
+                        }
+                        Text(
+                            text = headline,
+                            style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.labelLarge,
+                            color = if (telemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT) {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurface
+                            },
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (!compact || telemetry.hasReading) {
+                            val sub = when {
+                                telemetry.hasReading -> "${telemetry.status.label}${if (telemetry.sourceTransport.isNotBlank()) " • ${telemetry.sourceTransport}" else ""}"
+                                isConnected -> "Parses VBAT/mV serial/BLE telemetry automatically or tap Probe"
+                                else -> "Connect IoT board via USB, BLE, or Wi-Fi to guard against brownout"
+                            }
+                            Text(
+                                text = sub,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = tint,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+                if (isConnected && onProbeBattery != null) {
+                    AssistChip(
+                        onClick = onProbeBattery,
+                        leadingIcon = {
+                            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                        },
+                        label = { Text("Probe", style = MaterialTheme.typography.labelSmall) },
+                        modifier = Modifier.testTag("probe_battery_button"),
+                    )
+                }
+            }
+
+            if (telemetry.percentage != null || telemetry.voltageVolts != null) {
+                val fraction = telemetry.percentage?.let { (it / 100f).coerceIn(0f, 1f) }
+                    ?: telemetry.voltageVolts?.let { ((it - 3.0) / 1.2).toFloat().coerceIn(0f, 1f) }
+                    ?: 0f
+                LinearProgressIndicator(
+                    progress = { fraction },
+                    color = tint,
+                    trackColor = tint.copy(alpha = 0.2f),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
+            if (telemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT || telemetry.status == BatteryHealthStatus.LOW_WARNING) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Warning,
+                        contentDescription = null,
+                        tint = tint,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        text = if (telemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT) {
+                            "Mid-flash failure warning (< 3.45V): Flashing now can corrupt SPI flash or bootloader. Connect USB-C power!"
+                        } else {
+                            "Low voltage (< 3.70V): Plug in external USB power before erasing or flashing."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (telemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DownloadSortChipsRow(
+    selectedSort: DownloadSortOrder,
+    onSelectSort: (DownloadSortOrder) -> Unit,
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp),
+) {
+    LazyRow(
+        contentPadding = contentPadding,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier.testTag("download_sort_row"),
+    ) {
+        items(DownloadSortOrder.entries) { order ->
+            FilterChip(
+                selected = selectedSort == order,
+                onClick = { onSelectSort(order) },
+                leadingIcon = if (order == DownloadSortOrder.MOST_DOWNLOADED) {
+                    { Icon(Icons.Filled.SwapVert, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                } else null,
+                label = { Text(order.label, style = MaterialTheme.typography.labelMedium) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                ),
+                modifier = Modifier.testTag("sort_chip_${order.name.lowercase()}"),
+            )
+        }
+    }
+}
+
+@Composable
+fun FirmwareNoteEditorDialog(
+    firmware: FirmwareEntity,
+    onSave: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var noteText by remember(firmware.id, firmware.userNote) { mutableStateOf(firmware.userNote) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Filled.EditNote, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Text("Firmware Notes", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = firmware.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                OutlinedTextField(
+                    value = noteText,
+                    onValueChange = { noteText = it },
+                    label = { Text("Wiring, pinout, credentials, or flash notes") },
+                    placeholder = { Text("e.g. Hold BOOT (GPIO0) for CoreS3, SSID=LabNet, offset 0x10000") },
+                    minLines = 3,
+                    maxLines = 6,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("firmware_note_input"),
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(noteText.trim())
+                    onDismiss()
+                },
+                modifier = Modifier.testTag("save_firmware_note_button"),
+            ) {
+                Text("Save Note")
+            }
+        },
+        dismissButton = {
+            Row {
+                if (noteText.isNotBlank()) {
+                    TextButton(onClick = {
+                        onSave("")
+                        onDismiss()
+                    }) {
+                        Text("Clear")
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+}
+

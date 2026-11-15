@@ -16,13 +16,11 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.SettingsInputComponent
 import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.WebAsset
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.SettingsInputComponent
 import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material.icons.outlined.WebAsset
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -51,8 +49,6 @@ import com.example.ui.connect.ConnectScreen
 import com.example.ui.connect.ConnectViewModel
 import com.example.ui.forge.AiForgeScreen
 import com.example.ui.forge.AiForgeViewModel
-import com.example.ui.launcher.LauncherScreen
-import com.example.ui.launcher.LauncherViewModel
 import com.example.ui.nano.NanoEditorScreen
 import com.example.ui.nano.NanoViewModel
 import com.example.ui.terminal.TerminalScreen
@@ -67,7 +63,6 @@ sealed class PocketDestination(
 ) {
     data object Burner : PocketDestination("burner", "Burner", Icons.Filled.Bolt, Icons.Outlined.Bolt)
     data object Forge : PocketDestination("forge", "Forge", Icons.Filled.AutoAwesome, Icons.Outlined.AutoAwesome)
-    data object Launcher : PocketDestination("launcher", "Launcher", Icons.Filled.WebAsset, Icons.Outlined.WebAsset)
     data object Connect : PocketDestination("connect", "Connect", Icons.Filled.SettingsInputComponent, Icons.Outlined.SettingsInputComponent)
     data object Terminal : PocketDestination("terminal", "Term", Icons.Filled.Terminal, Icons.Outlined.Terminal)
     data object Nano : PocketDestination("nano", "Nano", Icons.Filled.Code, Icons.Outlined.Code)
@@ -95,7 +90,6 @@ fun PocketBurnerRoot(container: AppContainer) {
         listOf(
             PocketDestination.Burner,
             PocketDestination.Forge,
-            PocketDestination.Launcher,
             PocketDestination.Connect,
             PocketDestination.Terminal,
             PocketDestination.Nano,
@@ -104,7 +98,6 @@ fun PocketBurnerRoot(container: AppContainer) {
 
     val burnerViewModel: BurnerViewModel = viewModel(factory = BurnerViewModel.Factory(container))
     val forgeViewModel: AiForgeViewModel = viewModel(factory = AiForgeViewModel.Factory(container))
-    val launcherViewModel: LauncherViewModel = viewModel(factory = LauncherViewModel.Factory(container))
     val connectViewModel: ConnectViewModel = viewModel(factory = ConnectViewModel.Factory(container))
     val terminalViewModel: TerminalViewModel = viewModel(factory = TerminalViewModel.Factory(container))
     val nanoViewModel: NanoViewModel = viewModel(factory = NanoViewModel.Factory(container))
@@ -186,15 +179,6 @@ fun PocketBurnerRoot(container: AppContainer) {
                             onOpenInNano = { fileName, code, targetBoardId ->
                                 nanoViewModel.loadGeneratedScript(fileName, code, targetBoardId)
                                 navigateTo(PocketDestination.Nano.route)
-                            },
-                        )
-                    }
-                    composable(PocketDestination.Launcher.route) {
-                        LauncherScreen(
-                            viewModel = launcherViewModel,
-                            onNavigateTab = { targetRoute ->
-                                val valid = destinations.any { it.route == targetRoute }
-                                if (valid) navigateTo(targetRoute)
                             },
                         )
                     }

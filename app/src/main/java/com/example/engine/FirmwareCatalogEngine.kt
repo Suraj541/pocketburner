@@ -3,6 +3,7 @@ package com.example.engine
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.example.data.local.DownloadSortOrder
 import com.example.data.local.DownloadState
 import com.example.data.local.FirmwareDao
 import com.example.data.local.FirmwareEntity
@@ -248,14 +249,17 @@ class FirmwareCatalogEngine(
                 RepoParserType.CUSTOM_JSON -> parseCustomFeed(bodyText, repo.id, repo.url)
             }
 
-            // Preserve already-downloaded state if item ID matches
+            // Preserve already-downloaded state, accumulated downloadCount, and userNote if item ID matches
             val merged = parsed.map { item ->
                 val existing = firmwareDao.getById(item.id)
-                if (existing != null && existing.downloadState == DownloadState.DOWNLOADED.name && existing.localFilePath != null) {
+                if (existing != null) {
+                    val keepDownloaded = existing.downloadState == DownloadState.DOWNLOADED.name && existing.localFilePath != null
                     item.copy(
-                        localFilePath = existing.localFilePath,
-                        downloadState = DownloadState.DOWNLOADED.name,
-                        downloadProgress = 100,
+                        localFilePath = if (keepDownloaded) existing.localFilePath else null,
+                        downloadState = if (keepDownloaded) DownloadState.DOWNLOADED.name else DownloadState.NOT_DOWNLOADED.name,
+                        downloadProgress = if (keepDownloaded) 100 else 0,
+                        downloadCount = maxOf(existing.downloadCount, item.downloadCount),
+                        userNote = existing.userNote.ifBlank { item.userNote },
                     )
                 } else {
                     item
@@ -303,6 +307,10 @@ class FirmwareCatalogEngine(
         syncSingleRepo(repo)
     }
 
+    suspend fun updateFirmwareNote(firmwareId: String, note: String) = withContext(Dispatchers.IO) {
+        firmwareDao.updateUserNote(firmwareId, note.trim())
+    }
+
     suspend fun addCustomUrlFirmware(
         title: String,
         author: String,
@@ -315,6 +323,7 @@ class FirmwareCatalogEngine(
         baudRate: Int,
         sha256: String?,
         description: String,
+        userNote: String = "",
     ) = withContext(Dispatchers.IO) {
         val board = HardwareRegistry.findById(targetDeviceId)
         val ext = downloadUrl.substringBefore("?").substringAfterLast(".", "bin")
@@ -343,6 +352,7 @@ class FirmwareCatalogEngine(
             downloadState = DownloadState.NOT_DOWNLOADED.name,
             downloadProgress = 0,
             updatedAt = System.currentTimeMillis(),
+            userNote = userNote.trim(),
         )
         firmwareDao.upsert(item)
         taxonomyRepository.linkFirmwareBatch(listOf(item))
@@ -358,6 +368,7 @@ class FirmwareCatalogEngine(
         flashOffset: String,
         baudRate: Int,
         description: String,
+        userNote: String = "",
     ): Result<FirmwareEntity> = withContext(Dispatchers.IO) {
         try {
             val fileName = queryDisplayName(uri) ?: "custom_firmware.bin"
@@ -407,6 +418,8 @@ class FirmwareCatalogEngine(
                 downloadState = DownloadState.DOWNLOADED.name,
                 downloadProgress = 100,
                 updatedAt = System.currentTimeMillis(),
+                downloadCount = 1L,
+                userNote = userNote.trim(),
             )
             firmwareDao.upsert(entity)
             taxonomyRepository.linkFirmwareBatch(listOf(entity))
@@ -465,51 +478,12 @@ class FirmwareCatalogEngine(
             downloadState = DownloadState.DOWNLOADED.name,
             downloadProgress = 100,
             updatedAt = System.currentTimeMillis(),
+            downloadCount = 1L,
+            userNote = "Generated via Multi-Agent for $targetDeviceId ($framework)",
         )
         firmwareDao.upsert(entity)
         taxonomyRepository.linkFirmwareBatch(listOf(entity))
         entity
-    }
-
-    suspend fun importAndDownloadWebBinary(
-        downloadUrl: String,
-        suggestedFileName: String?,
-        targetDeviceId: String,
-    ): Result<FirmwareEntity> = withContext(Dispatchers.IO) {
-        val cleanName = (suggestedFileName?.takeIf { it.isNotBlank() }
-            ?: downloadUrl.substringBefore("?").substringAfterLast("/").ifBlank { "launcher_firmware.bin" })
-        val ext = cleanName.substringAfterLast(".", "bin").lowercase()
-        val board = HardwareRegistry.findById(targetDeviceId)
-            ?: HardwareRegistry.boards.first()
-        val item = FirmwareEntity(
-            id = "web_fw_${UUID.randomUUID().toString().take(8)}",
-            title = cleanName.substringBeforeLast("."),
-            author = "Launcher Web Portal",
-            category = FirmwareCategory.UI_LAUNCHER.label,
-            deviceTagsCsv = board.id,
-            family = board.family.name,
-            version = "web",
-            availableVersionsCsv = "web",
-            framework = "M5Launcher / Web Binary",
-            description = "Downloaded via PocketLauncher Web Portal ($cleanName).",
-            coverImageUrl = null,
-            downloadUrl = downloadUrl,
-            localFilePath = null,
-            fileExtension = ext,
-            sizeBytes = 0L,
-            sha256 = null,
-            flashOffset = board.appOffset,
-            defaultBaud = board.defaultBaud,
-            flashMode = board.flashMode,
-            repoSourceId = "launcher_web",
-            isCustomUserAdded = true,
-            downloadState = DownloadState.NOT_DOWNLOADED.name,
-            downloadProgress = 0,
-            updatedAt = System.currentTimeMillis(),
-        )
-        firmwareDao.upsert(item)
-        taxonomyRepository.linkFirmwareBatch(listOf(item))
-        downloadFirmwareOnDemand(item)
     }
 
     suspend fun downloadFirmwareOnDemand(
@@ -576,6 +550,7 @@ class FirmwareCatalogEngine(
                 downloadState = DownloadState.DOWNLOADED.name,
                 downloadProgress = 100,
                 updatedAt = System.currentTimeMillis(),
+                downloadCount = item.downloadCount + 1L,
             )
             firmwareDao.upsert(updated)
             Result.success(updated)
@@ -740,6 +715,14 @@ class FirmwareCatalogEngine(
                 .ifBlank { obj.optString("release_date") }
                 .take(10)
             val entrySourceUrl = obj.optString("repository").ifBlank { sourceUrl }
+            val parsedDownloads = listOf("downloads", "download_count", "dl_count", "downloadCount", "count")
+                .firstNotNullOfOrNull { key ->
+                    if (obj.has(key)) obj.optLong(key, -1L).takeIf { it >= 0L } else null
+                } ?: obj.optJSONObject("stats")?.optLong("downloads", 0L)?.coerceAtLeast(0L) ?: 0L
+            val parsedNote = listOf("note", "notes", "flash_note", "warning", "notice")
+                .firstNotNullOfOrNull { key ->
+                    obj.optString(key).takeIf { it.isNotBlank() && it != "null" }
+                } ?: ""
 
             val firstBoard = HardwareRegistry.findById(deviceCsv.substringBefore(",").trim())
             items.add(
@@ -772,6 +755,8 @@ class FirmwareCatalogEngine(
                     sourceType = if (isOfficialM5) "official" else "community",
                     releaseDate = releaseDate,
                     sourceUrl = entrySourceUrl,
+                    downloadCount = parsedDownloads,
+                    userNote = parsedNote,
                 )
             )
         }
@@ -953,6 +938,8 @@ class FirmwareCatalogEngine(
                 else -> FirmwareCategory.TOOLS.label
             }
             val shaDigest = asset.optString("digest").removePrefix("sha256:").takeIf { it.isNotBlank() }
+            val assetDownloads = asset.optLong("download_count", 0L).coerceAtLeast(0L)
+            val releaseNote = if (body.isNotBlank()) "Release $tag: ${body.take(140)}" else ""
 
             result.add(
                 FirmwareEntity(
@@ -984,6 +971,8 @@ class FirmwareCatalogEngine(
                     sourceType = if (isOfficialRepo) "official" else "community",
                     releaseDate = releaseDate,
                     sourceUrl = releaseHtmlUrl,
+                    downloadCount = assetDownloads,
+                    userNote = releaseNote,
                 )
             )
         }
@@ -1155,5 +1144,31 @@ class FirmwareCatalogEngine(
     companion object {
         const val M5BURNER_API_URL = "http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware"
         const val RPI_IMAGER_URL = "https://downloads.raspberrypi.com/os_list_imagingutility_v4.json"
+
+        fun sortFirmwareList(
+            items: List<FirmwareEntity>,
+            sortOrder: DownloadSortOrder,
+        ): List<FirmwareEntity> = when (sortOrder) {
+            DownloadSortOrder.MOST_DOWNLOADED -> items.sortedWith(
+                compareByDescending<FirmwareEntity> { it.downloadCount }
+                    .thenByDescending { it.isCustomUserAdded }
+                    .thenByDescending { it.updatedAt }
+            )
+            DownloadSortOrder.LOW_DOWNLOADED -> items.sortedWith(
+                compareBy<FirmwareEntity> { it.downloadCount }
+                    .thenBy { it.title.lowercase() }
+            )
+            DownloadSortOrder.RECENT -> items.sortedWith(
+                compareByDescending<FirmwareEntity> { it.isCustomUserAdded }
+                    .thenByDescending { it.updatedAt }
+            )
+            DownloadSortOrder.TITLE_ASC -> items.sortedBy { it.title.lowercase() }
+        }
+
+        fun formatDownloadCount(count: Long): String = when {
+            count >= 1_000_000L -> String.format(java.util.Locale.US, "%.1fM", count / 1_000_000.0)
+            count >= 1_000L -> String.format(java.util.Locale.US, "%.1fK", count / 1_000.0)
+            else -> count.coerceAtLeast(0L).toString()
+        }
     }
 }

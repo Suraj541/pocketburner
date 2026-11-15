@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
@@ -73,16 +74,22 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.local.FirmwareEntity
 import com.example.data.local.TransportType
 import com.example.engine.ActiveConnection
+import com.example.engine.BatteryHealthStatus
 import com.example.engine.BleBondStatus
 import com.example.engine.CryptoEnvelopeEngine
+import com.example.engine.FirmwareCatalogEngine
 import com.example.engine.OtaUploadProtocol
 import com.example.engine.TransportManager
 import com.example.engine.WifiOtaTargetConfig
 import com.example.hardware.HardwareRegistry
 import com.example.ui.components.ConnectionStatusPill
+import com.example.ui.components.DeviceBatteryMonitorCard
+import com.example.ui.components.DownloadSortChipsRow
 import com.example.ui.components.EncryptionTogglePill
+import com.example.ui.components.FirmwareNoteEditorDialog
 import com.example.ui.components.HardwareSpecInspectorDialog
 import com.example.ui.theme.LocalHardwareStatusColors
 import com.example.ui.theme.MonoTextStyles
@@ -100,6 +107,8 @@ fun ConnectScreen(
     val wifiOtaServiceRunning by viewModel.wifiOtaServiceRunning.collectAsStateWithLifecycle()
     val wifiOtaState by viewModel.wifiOtaState.collectAsStateWithLifecycle()
     val readyBinaries by viewModel.readyBinaries.collectAsStateWithLifecycle()
+    val binarySortOrder by viewModel.binarySortOrder.collectAsStateWithLifecycle()
+    val batteryTelemetry by viewModel.batteryTelemetry.collectAsStateWithLifecycle()
     val bleDevices by viewModel.filteredBleDevices.collectAsStateWithLifecycle()
     val isBleScanning by viewModel.isBleScanning.collectAsStateWithLifecycle()
     val bleServiceRunning by viewModel.bleServiceRunning.collectAsStateWithLifecycle()
@@ -117,6 +126,11 @@ fun ConnectScreen(
             ?: HardwareRegistry.findById(settings.selectedBoardId)
             ?: HardwareRegistry.boards.first()
     }
+
+    val isCriticalBattery = batteryTelemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT
+    var overrideCriticalBattery by remember { mutableStateOf(false) }
+    val allowFlashingPower = !isCriticalBattery || overrideCriticalBattery
+    var firmwareForNotes by remember { mutableStateOf<FirmwareEntity?>(null) }
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var wifiHost by remember { mutableStateOf("192.168.4.1") }
@@ -535,6 +549,32 @@ fun ConnectScreen(
                                 }
                             }
 
+                            DeviceBatteryMonitorCard(
+                                telemetry = batteryTelemetry,
+                                connectionState = connectionState,
+                                onProbeBattery = viewModel::probeHardwareBattery,
+                                modifier = Modifier.testTag("usb_flasher_battery_monitor"),
+                            )
+
+                            if (isCriticalBattery) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(
+                                        "Override low-battery safety lock",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                    Switch(
+                                        checked = overrideCriticalBattery,
+                                        onCheckedChange = { overrideCriticalBattery = it },
+                                        modifier = Modifier.testTag("usb_battery_safety_override_switch"),
+                                    )
+                                }
+                            }
+
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 OutlinedTextField(
                                     value = usbFlashOffset,
@@ -555,6 +595,11 @@ fun ConnectScreen(
 
                             if (readyBinaries.isNotEmpty()) {
                                 Text("Downloaded / Imported Binaries:", style = MaterialTheme.typography.labelMedium)
+                                DownloadSortChipsRow(
+                                    selectedSort = binarySortOrder,
+                                    onSelectSort = viewModel::setBinarySortOrder,
+                                    contentPadding = PaddingValues(0.dp),
+                                )
                                 FlowRow(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -566,9 +611,21 @@ fun ConnectScreen(
                                                 selectedFirmwareIdForUsb = fw.id
                                                 usbFlashOffset = fw.flashOffset.ifBlank { activeBoardSpec.appOffset }
                                             },
-                                            label = { Text(fw.title.take(22), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                            label = {
+                                                Text(
+                                                    "${fw.title.take(18)} (${FirmwareCatalogEngine.formatDownloadCount(fw.downloadCount)})",
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            },
                                         )
                                     }
+                                }
+                                chosenFirmware?.let { selectedFw ->
+                                    FirmwareBinaryNoteStrip(
+                                        firmware = selectedFw,
+                                        onEditNote = { firmwareForNotes = selectedFw },
+                                    )
                                 }
                             }
 
@@ -621,7 +678,7 @@ fun ConnectScreen(
                             ) {
                                 FilledTonalButton(
                                     onClick = { usbBinaryPickerLauncher.launch(arrayOf("*/*")) },
-                                    enabled = !usbFlashState.isFlashing,
+                                    enabled = !usbFlashState.isFlashing && allowFlashingPower,
                                     modifier = Modifier
                                         .weight(1f)
                                         .testTag("usb_pick_flash_binary_button"),
@@ -644,7 +701,7 @@ fun ConnectScreen(
                                             usbBinaryPickerLauncher.launch(arrayOf("*/*"))
                                         }
                                     },
-                                    enabled = !usbFlashState.isFlashing,
+                                    enabled = !usbFlashState.isFlashing && allowFlashingPower,
                                     modifier = Modifier
                                         .weight(1f)
                                         .testTag("usb_flash_selected_button"),
@@ -1021,6 +1078,32 @@ fun ConnectScreen(
                                 }
                             }
 
+                            DeviceBatteryMonitorCard(
+                                telemetry = batteryTelemetry,
+                                connectionState = connectionState,
+                                onProbeBattery = viewModel::probeHardwareBattery,
+                                modifier = Modifier.testTag("wifi_ota_battery_monitor"),
+                            )
+
+                            if (isCriticalBattery) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(
+                                        "Override low-battery safety lock",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                    Switch(
+                                        checked = overrideCriticalBattery,
+                                        onCheckedChange = { overrideCriticalBattery = it },
+                                        modifier = Modifier.testTag("ota_battery_safety_override_switch"),
+                                    )
+                                }
+                            }
+
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedTextField(
                                     value = otaHost,
@@ -1085,6 +1168,11 @@ fun ConnectScreen(
 
                             if (readyBinaries.isNotEmpty()) {
                                 Text("Select Ready Binary for OTA Push:", style = MaterialTheme.typography.labelMedium)
+                                DownloadSortChipsRow(
+                                    selectedSort = binarySortOrder,
+                                    onSelectSort = viewModel::setBinarySortOrder,
+                                    contentPadding = PaddingValues(0.dp),
+                                )
                                 FlowRow(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -1093,9 +1181,21 @@ fun ConnectScreen(
                                         FilterChip(
                                             selected = chosenOtaFirmware?.id == fw.id,
                                             onClick = { selectedFirmwareIdForOta = fw.id },
-                                            label = { Text(fw.title.take(22), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                            label = {
+                                                Text(
+                                                    "${fw.title.take(18)} (${FirmwareCatalogEngine.formatDownloadCount(fw.downloadCount)})",
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            },
                                         )
                                     }
+                                }
+                                chosenOtaFirmware?.let { selectedOta ->
+                                    FirmwareBinaryNoteStrip(
+                                        firmware = selectedOta,
+                                        onEditNote = { firmwareForNotes = selectedOta },
+                                    )
                                 }
                             }
 
@@ -1155,7 +1255,7 @@ fun ConnectScreen(
                                 }
                                 FilledTonalButton(
                                     onClick = { wifiOtaPickerLauncher.launch(arrayOf("*/*")) },
-                                    enabled = !wifiOtaState.isFlashing,
+                                    enabled = !wifiOtaState.isFlashing && allowFlashingPower,
                                     modifier = Modifier
                                         .weight(1f)
                                         .testTag("wifi_ota_pick_binary_button"),
@@ -1182,6 +1282,7 @@ fun ConnectScreen(
                                                 wifiOtaPickerLauncher.launch(arrayOf("*/*"))
                                             }
                                         },
+                                        enabled = allowFlashingPower,
                                         modifier = Modifier
                                             .weight(1f)
                                             .testTag("wifi_ota_push_button"),
@@ -1275,6 +1376,68 @@ fun ConnectScreen(
             onDismiss = { showBoardRegistry = false },
             onSelectBoard = { viewModel.selectBoardSpec(it.id) },
         )
+    }
+
+    firmwareForNotes?.let { fw ->
+        FirmwareNoteEditorDialog(
+            firmware = fw,
+            onSave = { noteText -> viewModel.updateFirmwareNote(fw.id, noteText) },
+            onDismiss = { firmwareForNotes = null },
+        )
+    }
+}
+
+@Composable
+private fun FirmwareBinaryNoteStrip(
+    firmware: FirmwareEntity,
+    onEditNote: () -> Unit,
+) {
+    Surface(
+        onClick = onEditNote,
+        shape = RoundedCornerShape(10.dp),
+        color = if (firmware.userNote.isNotBlank()) {
+            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.55f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("connect_binary_note_${firmware.id}"),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.EditNote,
+                contentDescription = "Edit note for ${firmware.title}",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (firmware.userNote.isNotBlank()) {
+                        firmware.userNote
+                    } else {
+                        "Add wiring, offset, or flash note for ${firmware.title}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (firmware.userNote.isNotBlank()) {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = if (firmware.userNote.isNotBlank()) "Edit" else "Add Note",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
     }
 }
 

@@ -7,6 +7,7 @@ import com.example.AppContainer
 import com.example.data.local.ScriptEntity
 import com.example.data.local.SecurityAndTransportSettings
 import com.example.engine.ActiveConnection
+import com.example.engine.HardwareBatteryTelemetry
 import com.example.engine.LogDirection
 import com.example.engine.ScriptTransferMode
 import com.example.engine.TerminalLogEntry
@@ -35,6 +36,7 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
 
     val logs: StateFlow<List<TerminalLogEntry>> = transport.logs
     val connectionState: StateFlow<ActiveConnection> = transport.connectionState
+    val batteryTelemetry: StateFlow<HardwareBatteryTelemetry> = transport.batteryTelemetry
 
     val settings: StateFlow<SecurityAndTransportSettings> = settingsStore.settings
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SecurityAndTransportSettings())
@@ -52,6 +54,7 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
     val openNanoEvents: SharedFlow<String> = _openNanoEvents.asSharedFlow()
 
     val quickMacros: List<QuickTaskMacro> = listOf(
+        QuickTaskMacro("Battery", "AT+CBC"),
         QuickTaskMacro("SysInfo", "uname -a; free -h; cat /proc/device-tree/model 2>/dev/null || import os; print(os.uname())"),
         QuickTaskMacro("I2C Scan", "import machine; print([hex(x) for x in machine.I2C(0).scan()])"),
         QuickTaskMacro("GPIO Blink", "from machine import Pin; p=Pin(2,Pin.OUT); p.value(1-p.value())"),
@@ -73,6 +76,15 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
                 if (next) "Command Encryption ENABLED (AES-256-GCM payload + TLS transport)"
                 else "Command Encryption DISABLED (Plaintext mode)"
             )
+        }
+    }
+
+    fun probeHardwareBattery() {
+        viewModelScope.launch {
+            val res = transport.probeHardwareBattery()
+            res.exceptionOrNull()?.let { err ->
+                transport.appendLog(LogDirection.ERR, err.message ?: "Battery probe failed")
+            }
         }
     }
 

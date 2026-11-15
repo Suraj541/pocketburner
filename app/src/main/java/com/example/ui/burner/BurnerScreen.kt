@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DeveloperBoard
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FileOpen
@@ -102,7 +103,10 @@ import com.example.data.local.FirmwareEntity
 import com.example.data.local.RepoParserType
 import com.example.data.local.RepoSourceEntity
 import com.example.engine.ActiveConnection
+import com.example.engine.BatteryHealthStatus
+import com.example.engine.FirmwareCatalogEngine
 import com.example.engine.FlashOptions
+import com.example.engine.HardwareBatteryTelemetry
 import com.example.engine.IntegrityStatus
 import com.example.engine.IntegrityVerificationReport
 import com.example.engine.RpiHeadlessConfig
@@ -112,6 +116,9 @@ import com.example.hardware.FlashProtocol
 import com.example.hardware.HardwareBoardSpec
 import com.example.hardware.HardwareRegistry
 import com.example.ui.components.ConnectionStatusPill
+import com.example.ui.components.DeviceBatteryMonitorCard
+import com.example.ui.components.DownloadSortChipsRow
+import com.example.ui.components.FirmwareNoteEditorDialog
 import com.example.ui.components.HardwareSpecInspectorDialog
 import com.example.ui.theme.LocalHardwareStatusColors
 import com.example.ui.theme.MonoTextStyles
@@ -133,9 +140,11 @@ fun BurnerScreen(
     val selectedDevice by viewModel.selectedDevice.collectAsStateWithLifecycle()
     val isDevicesExpanded by viewModel.isDevicesExpanded.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
+    val sortOrder by viewModel.sortOrder.collectAsStateWithLifecycle()
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
     val syncMessage by viewModel.syncMessage.collectAsStateWithLifecycle()
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    val batteryTelemetry by viewModel.batteryTelemetry.collectAsStateWithLifecycle()
     val flashSession by viewModel.flashSession.collectAsStateWithLifecycle()
     val integrityReports by viewModel.integrityReports.collectAsStateWithLifecycle()
 
@@ -144,6 +153,7 @@ fun BurnerScreen(
     var showBoardSpecsForId by remember { mutableStateOf<String?>(null) }
     var firmwareToFlash by remember { mutableStateOf<FirmwareEntity?>(null) }
     var firmwareToVerify by remember { mutableStateOf<FirmwareEntity?>(null) }
+    var firmwareForNotes by remember { mutableStateOf<FirmwareEntity?>(null) }
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -284,6 +294,13 @@ fun BurnerScreen(
                 }
             }
 
+            // Sort Downloads Filter (Most Downloaded -> Low Downloads, etc.)
+            DownloadSortChipsRow(
+                selectedSort = sortOrder,
+                onSelectSort = viewModel::setSortOrder,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
             // Collapsible Hierarchical Devices Filter (Series -> Child Devices from Room)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -405,6 +422,7 @@ fun BurnerScreen(
                                     showBoardSpecsForId = firstDev.ifBlank { "CoreS3" }
                                 },
                                 onInspectVerification = { firmwareToVerify = item },
+                                onEditNote = { firmwareForNotes = item },
                             )
                         }
                     }
@@ -434,12 +452,12 @@ fun BurnerScreen(
     if (showAddFirmwareDialog) {
         AddCustomFirmwareDialog(
             onDismiss = { showAddFirmwareDialog = false },
-            onAddLocal = { uri, title, cat, dev, fw, ver, offset, baud, desc ->
-                viewModel.addCustomLocalFirmware(uri, title, cat, dev, fw, ver, offset, baud, desc)
+            onAddLocal = { uri, title, cat, dev, fw, ver, offset, baud, desc, note ->
+                viewModel.addCustomLocalFirmware(uri, title, cat, dev, fw, ver, offset, baud, desc, note)
                 showAddFirmwareDialog = false
             },
-            onAddUrl = { title, author, cat, dev, fw, ver, url, offset, baud, sha, desc ->
-                viewModel.addCustomUrlFirmware(title, author, cat, dev, fw, ver, url, offset, baud, sha, desc)
+            onAddUrl = { title, author, cat, dev, fw, ver, url, offset, baud, sha, desc, note ->
+                viewModel.addCustomUrlFirmware(title, author, cat, dev, fw, ver, url, offset, baud, sha, desc, note)
                 showAddFirmwareDialog = false
             },
         )
@@ -470,6 +488,7 @@ fun BurnerScreen(
         FlashConsoleDialog(
             firmware = fw,
             connectionState = connectionState,
+            batteryTelemetry = batteryTelemetry,
             flashSession = flashSession,
             onDismiss = {
                 viewModel.resetFlashSession()
@@ -479,6 +498,7 @@ fun BurnerScreen(
                 firmwareToFlash = null
                 onNavigateConnect()
             },
+            onProbeBattery = viewModel::probeHardwareBattery,
             onStartFlash = { board, options -> viewModel.flashFirmware(fw, board, options) },
             onEraseFlash = { board -> viewModel.eraseBoardFlash(board) },
         )
@@ -489,7 +509,19 @@ fun BurnerScreen(
             firmware = fw,
             integrityReport = fw.localFilePath?.let { integrityReports[it] },
             onVerifyBinary = { viewModel.verifyDownloadedFirmware(fw) },
+            onEditNote = {
+                firmwareToVerify = null
+                firmwareForNotes = fw
+            },
             onDismiss = { firmwareToVerify = null },
+        )
+    }
+
+    firmwareForNotes?.let { fw ->
+        FirmwareNoteEditorDialog(
+            firmware = fw,
+            onSave = { updatedNote -> viewModel.updateFirmwareNote(fw.id, updatedNote) },
+            onDismiss = { firmwareForNotes = null },
         )
     }
 }
@@ -545,14 +577,13 @@ private fun FirmwareShowcaseCard(
     onDeleteDownload: () -> Unit,
     onInspectBoard: () -> Unit,
     onInspectVerification: () -> Unit,
+    onEditNote: () -> Unit,
 ) {
     val statusColors = LocalHardwareStatusColors.current
     val dlState = runCatching { DownloadState.valueOf(item.downloadState) }.getOrDefault(DownloadState.NOT_DOWNLOADED)
     val family = runCatching { DeviceFamily.valueOf(item.family) }.getOrDefault(DeviceFamily.ESP_IOT)
     val fallbackDrawableRes = remember(family, item.category, item.title) {
         when {
-            item.category.contains("Launcher", ignoreCase = true) ||
-                item.title.contains("Launcher", ignoreCase = true) -> R.drawable.img_fw_launcher_ota
             family == DeviceFamily.M5STACK -> R.drawable.img_fw_m5stack
             family == DeviceFamily.ARDUINO -> R.drawable.img_fw_arduino
             family == DeviceFamily.RASPBERRY_PI -> R.drawable.img_fw_rpi_os
@@ -561,6 +592,9 @@ private fun FirmwareShowcaseCard(
     }
     val isOfficial = item.sourceType.equals("official", ignoreCase = true) && !item.isCustomUserAdded
     val publisherLabel = item.vendor.ifBlank { item.author }
+    val downloadCountLabel = remember(item.downloadCount) {
+        FirmwareCatalogEngine.formatDownloadCount(item.downloadCount)
+    }
 
     ElevatedCard(
         shape = RoundedCornerShape(18.dp),
@@ -685,7 +719,7 @@ private fun FirmwareShowcaseCard(
                 )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
@@ -696,6 +730,29 @@ private fun FirmwareShowcaseCard(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.testTag("download_count_badge_${item.id}"),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.CloudDownload,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(12.dp),
+                            )
+                            Text(
+                                text = "$downloadCountLabel dl",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                        }
+                    }
                     if (!item.sha256.isNullOrBlank()) {
                         Surface(
                             color = MaterialTheme.colorScheme.secondaryContainer,
@@ -718,6 +775,39 @@ private fun FirmwareShowcaseCard(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+
+                if (item.userNote.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(8.dp),
+                        onClick = onEditNote,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("firmware_note_preview_${item.id}"),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.EditNote,
+                                contentDescription = "Edit firmware note",
+                                tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Text(
+                                text = item.userNote,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+
                 Spacer(Modifier.height(8.dp))
 
                 FlowRow(
@@ -760,7 +850,7 @@ private fun FirmwareShowcaseCard(
                     }
                     DownloadState.DOWNLOADED -> {
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
@@ -775,21 +865,39 @@ private fun FirmwareShowcaseCard(
                                 Spacer(Modifier.width(6.dp))
                                 Text("Burn / Flash")
                             }
+                            IconButton(
+                                onClick = onEditNote,
+                                modifier = Modifier.testTag("edit_note_button_${item.id}"),
+                            ) {
+                                Icon(Icons.Filled.EditNote, contentDescription = "Edit firmware note")
+                            }
                             IconButton(onClick = onDeleteDownload) {
                                 Icon(Icons.Filled.Delete, contentDescription = "Remove local file")
                             }
                         }
                     }
                     DownloadState.NOT_DOWNLOADED, DownloadState.ERROR -> {
-                        Button(
-                            onClick = onDownload,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("download_button_${item.id}"),
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(if (dlState == DownloadState.ERROR) "Retry Download" else "Download")
+                            Button(
+                                onClick = onDownload,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("download_button_${item.id}"),
+                            ) {
+                                Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(if (dlState == DownloadState.ERROR) "Retry Download" else "Download")
+                            }
+                            IconButton(
+                                onClick = onEditNote,
+                                modifier = Modifier.testTag("edit_note_button_${item.id}"),
+                            ) {
+                                Icon(Icons.Filled.EditNote, contentDescription = "Add or edit firmware note")
+                            }
                         }
                     }
                 }
@@ -802,8 +910,8 @@ private fun FirmwareShowcaseCard(
 @Composable
 private fun AddCustomFirmwareDialog(
     onDismiss: () -> Unit,
-    onAddLocal: (Uri, String, FirmwareCategory, String, String, String, String, Int, String) -> Unit,
-    onAddUrl: (String, String, FirmwareCategory, String, String, String, String, String, Int, String?, String) -> Unit,
+    onAddLocal: (Uri, String, FirmwareCategory, String, String, String, String, Int, String, String) -> Unit,
+    onAddUrl: (String, String, FirmwareCategory, String, String, String, String, String, Int, String?, String, String) -> Unit,
 ) {
     var tabIndex by remember { mutableIntStateOf(0) }
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
@@ -818,6 +926,7 @@ private fun AddCustomFirmwareDialog(
     var baudRateText by remember { mutableStateOf("921600") }
     var sha256 by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
+    var userNote by remember { mutableStateOf("") }
 
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -981,6 +1090,13 @@ private fun AddCustomFirmwareDialog(
                         label = { Text("Release Notes / Description") },
                         modifier = Modifier.fillMaxWidth(),
                     )
+                    OutlinedTextField(
+                        value = userNote,
+                        onValueChange = { userNote = it },
+                        label = { Text("Operator Note / Wiring Reminder (Optional)") },
+                        placeholder = { Text("e.g. Hold BOOT on GPIO0, 115200 baud") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -993,10 +1109,10 @@ private fun AddCustomFirmwareDialog(
                             val baud = baudRateText.toIntOrNull() ?: 921600
                             if (tabIndex == 0) {
                                 selectedUri?.let { uri ->
-                                    onAddLocal(uri, title, selectedCategory, selectedDevice, framework, version, flashOffset, baud, description)
+                                    onAddLocal(uri, title, selectedCategory, selectedDevice, framework, version, flashOffset, baud, description, userNote)
                                 }
                             } else {
-                                onAddUrl(title, author, selectedCategory, selectedDevice, framework, version, url, flashOffset, baud, sha256, description)
+                                onAddUrl(title, author, selectedCategory, selectedDevice, framework, version, url, flashOffset, baud, sha256, description, userNote)
                             }
                         },
                         modifier = Modifier.testTag("save_custom_firmware_button"),
@@ -1124,9 +1240,11 @@ private fun RepoManagerDialog(
 private fun FlashConsoleDialog(
     firmware: FirmwareEntity,
     connectionState: ActiveConnection,
+    batteryTelemetry: HardwareBatteryTelemetry,
     flashSession: FlashSessionState,
     onDismiss: () -> Unit,
     onNavigateConnect: () -> Unit,
+    onProbeBattery: () -> Unit,
     onStartFlash: (HardwareBoardSpec, FlashOptions) -> Unit,
     onEraseFlash: (HardwareBoardSpec) -> Unit,
 ) {
@@ -1138,6 +1256,7 @@ private fun FlashConsoleDialog(
     var flashOffset by remember { mutableStateOf(firmware.flashOffset) }
     var flashMode by remember { mutableStateOf(firmware.flashMode) }
     var eraseBeforeFlash by remember { mutableStateOf(false) }
+    var overrideCriticalBattery by remember { mutableStateOf(false) }
 
     // RPi headless options
     var rpiHostname by remember { mutableStateOf("pocketpi") }
@@ -1145,6 +1264,9 @@ private fun FlashConsoleDialog(
     var rpiUser by remember { mutableStateOf("pi") }
     var rpiWifiSsid by remember { mutableStateOf("") }
     var rpiWifiPass by remember { mutableStateOf("") }
+
+    val isCriticalBattery = batteryTelemetry.status == BatteryHealthStatus.CRITICAL_BROWNOUT
+    val canBurn = !flashSession.isFlashing && (!isCriticalBattery || overrideCriticalBattery)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1155,6 +1277,44 @@ private fun FlashConsoleDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 ConnectionStatusPill(connectionState = connectionState, onClick = onNavigateConnect)
+
+                DeviceBatteryMonitorCard(
+                    telemetry = batteryTelemetry,
+                    connectionState = connectionState,
+                    onProbeBattery = onProbeBattery,
+                    modifier = Modifier.testTag("flash_dialog_battery_monitor"),
+                )
+                if (isCriticalBattery) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            "Override low-battery safety lock",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Switch(
+                            checked = overrideCriticalBattery,
+                            onCheckedChange = { overrideCriticalBattery = it },
+                            modifier = Modifier.testTag("battery_safety_override_switch"),
+                        )
+                    }
+                }
+                if (firmware.userNote.isNotBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.6f),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "Note: ${firmware.userNote}",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                }
 
                 Text("Target Board Profile", style = MaterialTheme.typography.labelLarge)
                 var boardSearchQuery by remember { mutableStateOf("") }
@@ -1267,7 +1427,7 @@ private fun FlashConsoleDialog(
         },
         confirmButton = {
             Button(
-                enabled = !flashSession.isFlashing,
+                enabled = canBurn,
                 onClick = {
                     val opts = FlashOptions(
                         baudRate = baudRate,
@@ -1296,7 +1456,7 @@ private fun FlashConsoleDialog(
         dismissButton = {
             Row {
                 if (selectedBoard.protocol == FlashProtocol.ESPTOOL_SLIP) {
-                    TextButton(enabled = !flashSession.isFlashing, onClick = { onEraseFlash(selectedBoard) }) {
+                    TextButton(enabled = canBurn, onClick = { onEraseFlash(selectedBoard) }) {
                         Icon(Icons.Filled.DeleteSweep, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Erase")
@@ -1313,6 +1473,7 @@ private fun FirmwareProvenanceDialog(
     firmware: FirmwareEntity,
     integrityReport: IntegrityVerificationReport?,
     onVerifyBinary: () -> Unit,
+    onEditNote: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val isOfficial = firmware.sourceType.equals("official", ignoreCase = true) && !firmware.isCustomUserAdded
@@ -1334,12 +1495,34 @@ private fun FirmwareProvenanceDialog(
                 Text(firmware.title, style = MaterialTheme.typography.titleMedium)
                 Text("Publisher / Vendor: ${firmware.vendor.ifBlank { firmware.author }}", style = MaterialTheme.typography.bodySmall)
                 Text(
+                    "Downloads: ${FirmwareCatalogEngine.formatDownloadCount(firmware.downloadCount)} (${firmware.downloadCount} total)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
                     "Classification: ${if (isOfficial) "Official Vendor Package" else "Community / Third-Party Build (unverified by vendor)"}",
                     style = MaterialTheme.typography.bodySmall,
                     color = if (isOfficial) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
                 )
                 Text("Version: ${firmware.version}${if (firmware.releaseDate.isNotBlank()) " • Released ${firmware.releaseDate}" else ""}", style = MaterialTheme.typography.bodySmall)
                 Text("Compatible Boards: ${firmware.deviceTagsCsv}", style = MaterialTheme.typography.bodySmall)
+                HorizontalDivider()
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Firmware Note:", style = MaterialTheme.typography.labelMedium)
+                    TextButton(onClick = onEditNote) {
+                        Icon(Icons.Filled.EditNote, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (firmware.userNote.isBlank()) "Add Note" else "Edit Note")
+                    }
+                }
+                Text(
+                    text = firmware.userNote.ifBlank { "No notes recorded yet." },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 HorizontalDivider()
                 Text("Expected SHA-256 Checksum:", style = MaterialTheme.typography.labelMedium)
                 Text(

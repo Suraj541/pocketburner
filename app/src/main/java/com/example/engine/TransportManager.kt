@@ -177,6 +177,35 @@ sealed class ActiveConnection {
     ) : ActiveConnection()
 }
 
+enum class BatteryHealthStatus(val label: String) {
+    UNKNOWN("Awaiting Telemetry"),
+    SAFE("Power Safe"),
+    LOW_WARNING("Low Voltage (< 3.70V)"),
+    CRITICAL_BROWNOUT("CRITICAL — Brownout Risk"),
+}
+
+data class HardwareBatteryTelemetry(
+    val voltageVolts: Double? = null,
+    val millivolts: Int? = null,
+    val percentage: Int? = null,
+    val isCharging: Boolean? = null,
+    val sourceTransport: String = "",
+    val rawLine: String = "",
+    val updatedAtMs: Long = 0L,
+    val status: BatteryHealthStatus = BatteryHealthStatus.UNKNOWN,
+) {
+    val hasReading: Boolean get() = voltageVolts != null || percentage != null
+
+    fun formattedVoltage(): String = when {
+        voltageVolts != null && millivolts != null ->
+            String.format(java.util.Locale.US, "%.2f V (%d mV)", voltageVolts, millivolts)
+        voltageVolts != null ->
+            String.format(java.util.Locale.US, "%.2f V", voltageVolts)
+        millivolts != null -> "$millivolts mV"
+        else -> "-- V"
+    }
+}
+
 class TransportManager(
     private val context: Context,
     private val settingsStore: SettingsStore,
@@ -231,6 +260,9 @@ class TransportManager(
     private val _rawIncomingBytes = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
     val rawIncomingBytes: SharedFlow<ByteArray> = _rawIncomingBytes.asSharedFlow()
 
+    private val _batteryTelemetry = MutableStateFlow(HardwareBatteryTelemetry())
+    val batteryTelemetry: StateFlow<HardwareBatteryTelemetry> = _batteryTelemetry.asStateFlow()
+
     private var logCounter = 0L
 
     // Active transport handles
@@ -249,6 +281,7 @@ class TransportManager(
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleTxChar: BluetoothGattCharacteristic? = null
     private var bleRxChar: BluetoothGattCharacteristic? = null
+    private var bleBatteryChar: BluetoothGattCharacteristic? = null
     private var bleMtu = 23
 
     private val isFlashingMode = AtomicBoolean(false)
@@ -907,6 +940,43 @@ class TransportManager(
                 } else {
                     appendLog(LogDirection.ERR, "No writable GATT UART characteristic found.")
                 }
+
+                // Also inspect standard BLE Battery Service (0x180F / 0x2A19) if exposed by the IoT board
+                val basChar = gatt.getService(BATTERY_SERVICE_UUID)?.getCharacteristic(BATTERY_LEVEL_CHAR_UUID)
+                bleBatteryChar = basChar
+                if (basChar != null && hasBlePermissions()) {
+                    if (bleRxChar == null) {
+                        gatt.readCharacteristic(basChar)
+                    } else {
+                        scope.launch {
+                            kotlinx.coroutines.delay(250)
+                            runCatching { gatt.readCharacteristic(basChar) }
+                        }
+                    }
+                }
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int,
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                    updateBatteryFromBleLevelByte(value)
+                }
+            }
+
+            @Deprecated("Deprecated on API 33")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                    @Suppress("DEPRECATION")
+                    characteristic.value?.let(::updateBatteryFromBleLevelByte)
+                }
             }
 
             override fun onCharacteristicChanged(
@@ -914,6 +984,10 @@ class TransportManager(
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray,
             ) {
+                if (characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                    updateBatteryFromBleLevelByte(value)
+                    return
+                }
                 scope.launch {
                     _rawIncomingBytes.emit(value)
                     handleIncomingText(value.toString(Charsets.UTF_8).trimEnd('\r', '\n'))
@@ -924,12 +998,35 @@ class TransportManager(
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 @Suppress("DEPRECATION")
                 val data = characteristic.value ?: return
+                if (characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                    updateBatteryFromBleLevelByte(data)
+                    return
+                }
                 scope.launch {
                     _rawIncomingBytes.emit(data)
                     handleIncomingText(data.toString(Charsets.UTF_8).trimEnd('\r', '\n'))
                 }
             }
         }, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun updateBatteryFromBleLevelByte(bytes: ByteArray) {
+        if (bytes.isEmpty()) return
+        val pct = bytes[0].toInt() and 0xFF
+        val current = _batteryTelemetry.value
+        val status = classifyBatteryStatus(
+            voltageVolts = current.voltageVolts,
+            percentage = pct,
+            isCharging = current.isCharging,
+            isUsbVbus = false,
+        )
+        _batteryTelemetry.value = current.copy(
+            percentage = pct.coerceIn(0, 100),
+            sourceTransport = "BLE GATT 0x2A19",
+            rawLine = "GATT Battery Level: $pct%",
+            updatedAtMs = System.currentTimeMillis(),
+            status = status,
+        )
     }
 
     // ==================== WI-FI TCP / TLS & NSD ====================
@@ -1131,14 +1228,56 @@ class TransportManager(
 
     private suspend fun handleIncomingText(text: String) {
         val settings = settingsStore.settings.first()
-        if (text.startsWith("PBENC1:")) {
+        val effectiveText = if (text.startsWith("PBENC1:")) {
             val decrypted = CryptoEnvelopeEngine.decryptEnvelope(text, settings.preSharedKey)
             if (decrypted != null) {
-                appendLog(LogDirection.ENC, "AES-256-GCM RX: ${decrypted.toString(Charsets.UTF_8).trimEnd()}")
-                return
+                val plain = decrypted.toString(Charsets.UTF_8).trimEnd()
+                appendLog(LogDirection.ENC, "AES-256-GCM RX: $plain")
+                plain
+            } else {
+                appendLog(LogDirection.RX, text)
+                text
+            }
+        } else {
+            appendLog(LogDirection.RX, text)
+            text
+        }
+        val transportLabel = currentTransportLabel()
+        effectiveText.lineSequence().forEach { line ->
+            parseBatteryTelemetryLine(line, transportLabel)?.let { parsed ->
+                _batteryTelemetry.value = parsed
             }
         }
-        appendLog(LogDirection.RX, text)
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun probeHardwareBattery(): Result<String> = withContext(Dispatchers.IO) {
+        val conn = _connectionState.value
+        if (conn is ActiveConnection.Disconnected) {
+            return@withContext Result.failure(IllegalStateException("Connect hardware via USB OTG, BLE, or Wi-Fi before probing voltage."))
+        }
+        val gatt = bluetoothGatt
+        val basChar = bleBatteryChar
+        if (conn is ActiveConnection.BleConnected && gatt != null && basChar != null && hasBlePermissions()) {
+            val started = runCatching { gatt.readCharacteristic(basChar) }.getOrDefault(false)
+            if (started) {
+                appendLog(LogDirection.SYS, "Reading BLE Battery Service (0x2A19)...")
+                return@withContext Result.success("BLE Battery Service read dispatched.")
+            }
+        }
+        // Dispatch clean voltage query command over active serial/socket/UART link
+        val res = sendCommand("AT+CBC")
+        return@withContext res.fold(
+            onSuccess = { Result.success("Sent hardware battery telemetry probe (AT+CBC).") },
+            onFailure = { err -> Result.failure(err) },
+        )
+    }
+
+    private fun currentTransportLabel(): String = when (val c = _connectionState.value) {
+        is ActiveConnection.UsbConnected -> "USB ${c.board.id}"
+        is ActiveConnection.BleConnected -> "BLE ${c.deviceName}"
+        is ActiveConnection.WifiConnected -> "Wi-Fi ${c.host}"
+        is ActiveConnection.Disconnected -> ""
     }
 
     @SuppressLint("MissingPermission")
@@ -1167,7 +1306,9 @@ class TransportManager(
         bluetoothGatt = null
         bleTxChar = null
         bleRxChar = null
+        bleBatteryChar = null
 
+        _batteryTelemetry.value = HardwareBatteryTelemetry()
         _connectionState.value = ActiveConnection.Disconnected
     }
 
@@ -1184,7 +1325,142 @@ class TransportManager(
         private val NUS_RX_CHAR_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
         private val NUS_TX_CHAR_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
         private val HM10_SERVICE_UUID = UUID.fromString("0000FFE0-0000-1000-8000-00805F9B34FB")
+        private val BATTERY_SERVICE_UUID = UUID.fromString("0000180F-0000-1000-8000-00805F9B34FB")
+        private val BATTERY_LEVEL_CHAR_UUID = UUID.fromString("00002A19-0000-1000-8000-00805F9B34FB")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        const val CRITICAL_VOLTAGE_THRESHOLD = 3.45
+        const val LOW_VOLTAGE_THRESHOLD = 3.70
+
+        private val AT_CBC_REGEX = Regex("""\+CBC:\s*(\d+)\s*,\s*(\d{1,3})\s*,\s*(\d{3,5})""")
+        private val MV_REGEX = Regex("""(?:bat(?:tery)?(?:_mv)?|vbat(?:_mv)?|volt(?:age)?(?:_mv)?|cell)?\s*[:=,"]?\s*(\d{3,5})\s*mV""", RegexOption.IGNORE_CASE)
+        private val MV_KEY_REGEX = Regex("""(?:battery_mv|vbat_mv|voltage_mv)["']?\s*[:=]\s*(\d{3,5})""", RegexOption.IGNORE_CASE)
+        private val VOLT_REGEX = Regex("""(?:vbat|bat(?:tery)?|volt(?:age)?|vcell|vbus)?\s*[:=,"]?\s*(\d\.\d{1,3})\s*V\b""", RegexOption.IGNORE_CASE)
+        private val VOLT_KEY_REGEX = Regex("""(?:vbat|battery_v|voltage)["']?\s*[:=]\s*(\d\.\d{1,3})""", RegexOption.IGNORE_CASE)
+        private val PCT_REGEX = Regex("""(\d{1,3})\s*%""")
+        private val PCT_KEY_REGEX = Regex("""(?:pct|percent|battery_pct|soc|level)["']?\s*[:=]\s*(\d{1,3})""", RegexOption.IGNORE_CASE)
+
+        fun classifyBatteryStatus(
+            voltageVolts: Double?,
+            percentage: Int?,
+            isCharging: Boolean? = null,
+            isUsbVbus: Boolean = false,
+        ): BatteryHealthStatus {
+            if (voltageVolts == null && percentage == null) return BatteryHealthStatus.UNKNOWN
+            if (voltageVolts != null) {
+                if (isUsbVbus && voltageVolts >= 4.5) return BatteryHealthStatus.SAFE
+                return when {
+                    voltageVolts < CRITICAL_VOLTAGE_THRESHOLD -> BatteryHealthStatus.CRITICAL_BROWNOUT
+                    voltageVolts < LOW_VOLTAGE_THRESHOLD -> BatteryHealthStatus.LOW_WARNING
+                    else -> {
+                        if (percentage != null && percentage < 15 && isCharging != true) {
+                            BatteryHealthStatus.CRITICAL_BROWNOUT
+                        } else {
+                            BatteryHealthStatus.SAFE
+                        }
+                    }
+                }
+            }
+            val pct = percentage ?: return BatteryHealthStatus.UNKNOWN
+            return when {
+                pct < 15 && isCharging != true -> BatteryHealthStatus.CRITICAL_BROWNOUT
+                pct < 35 -> BatteryHealthStatus.LOW_WARNING
+                else -> BatteryHealthStatus.SAFE
+            }
+        }
+
+        fun parseBatteryTelemetryLine(
+            rawLine: String,
+            transportLabel: String = "",
+            nowMs: Long = System.currentTimeMillis(),
+        ): HardwareBatteryTelemetry? {
+            val trimmed = rawLine.trim()
+            if (trimmed.isBlank()) return null
+
+            val lower = trimmed.lowercase()
+            val hasBatteryKeyword = lower.contains("bat") ||
+                lower.contains("vbat") ||
+                lower.contains("volt") ||
+                lower.contains("+cbc") ||
+                lower.contains("vbus") ||
+                lower.contains("axp") ||
+                lower.contains("power") ||
+                lower.contains("cell")
+
+            if (!hasBatteryKeyword && !MV_REGEX.containsMatchIn(trimmed) && !VOLT_REGEX.containsMatchIn(trimmed)) {
+                return null
+            }
+
+            var voltageVolts: Double? = null
+            var millivolts: Int? = null
+            var percentage: Int? = null
+            var cbcCharging: Boolean? = null
+
+            AT_CBC_REGEX.find(trimmed)?.let { m ->
+                val bcs = m.groupValues[1].toIntOrNull()
+                cbcCharging = when (bcs) {
+                    1, 2 -> true
+                    0 -> false
+                    else -> null
+                }
+                percentage = m.groupValues[2].toIntOrNull()?.coerceIn(0, 100)
+                millivolts = m.groupValues[3].toIntOrNull()
+                voltageVolts = millivolts?.let { it / 1000.0 }
+            }
+
+            if (millivolts == null) {
+                val mvMatch = MV_KEY_REGEX.find(trimmed) ?: MV_REGEX.find(trimmed)
+                val mvVal = mvMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (mvVal != null && mvVal in 1500..6500) {
+                    millivolts = mvVal
+                    voltageVolts = mvVal / 1000.0
+                }
+            }
+
+            if (voltageVolts == null) {
+                val vMatch = VOLT_REGEX.find(trimmed) ?: VOLT_KEY_REGEX.find(trimmed)
+                val vVal = vMatch?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+                if (vVal != null && vVal in 1.5..6.5) {
+                    voltageVolts = vVal
+                    millivolts = kotlin.math.round(vVal * 1000.0).toInt()
+                }
+            }
+
+            if (percentage == null) {
+                val pMatch = PCT_KEY_REGEX.find(trimmed) ?: PCT_REGEX.find(trimmed)
+                val pVal = pMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (pVal != null && pVal in 0..100) {
+                    percentage = pVal
+                }
+            }
+
+            if (voltageVolts == null && percentage == null) return null
+
+            val isCharging = cbcCharging ?: when {
+                lower.contains("discharg") -> false
+                lower.contains("charging") || lower.contains("chg=1") || lower.contains("\"charging\":true") -> true
+                else -> null
+            }
+            val isUsbVbus = lower.contains("vbus") || lower.contains("usb_power")
+
+            val status = classifyBatteryStatus(
+                voltageVolts = voltageVolts,
+                percentage = percentage,
+                isCharging = isCharging,
+                isUsbVbus = isUsbVbus,
+            )
+
+            return HardwareBatteryTelemetry(
+                voltageVolts = voltageVolts,
+                millivolts = millivolts,
+                percentage = percentage,
+                isCharging = isCharging,
+                sourceTransport = transportLabel,
+                rawLine = trimmed.take(120),
+                updatedAtMs = nowMs,
+                status = status,
+            )
+        }
 
         fun filterBleDevices(
             devices: List<DiscoveredBleDevice>,

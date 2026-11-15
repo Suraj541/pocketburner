@@ -1,7 +1,6 @@
 <resources>
     <string name="app_name">PocketBurner</string>
     <string name="nav_burner">Burner</string>
-    <string name="nav_launcher">Launcher</string>
     <string name="nav_connect">Connect</string>
     <string name="nav_terminal">Term</string>
     <string name="nav_nano">Nano</string>
