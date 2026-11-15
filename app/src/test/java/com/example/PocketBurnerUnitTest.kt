@@ -538,4 +538,44 @@ class PocketBurnerUnitTest {
         assertEquals("https://m5burner-cdn.m5stack.com/firmware/bruce_cardputer.bin", parsedCatalog.first().downloadUrl)
         assertEquals("https://m5burner-cdn.m5stack.com/cover/bruce_cover.png", parsedCatalog.first().coverImageUrl)
     }
+
+    @Test
+    fun m5BurnerHkCdnApi_configuredAndParsesCdnFirmwareEntries() = kotlinx.coroutines.test.runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val container = AppContainer.getInstance(context)
+        val engine = container.firmwareCatalogEngine
+
+        val m5Repo = engine.defaultRepositories.first { it.id == "repo_m5burner" }
+        assertEquals("http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware", m5Repo.url)
+
+        val oldRepo = m5Repo.copy(url = "https://burner.m5stack.com/api/v1/firmware")
+        container.database.repoSourceDao().upsert(oldRepo)
+        engine.ensureDefaultReposSeeded()
+        val migrated = container.database.repoSourceDao().getAll().first { it.id == "repo_m5burner" }
+        assertEquals("http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware", migrated.url)
+
+        val cdnPayload = """
+            {
+              "rows": [
+                {
+                  "fid": "fw_9001",
+                  "name": "M5StickC Plus2 UIFlow2",
+                  "author": "M5Stack",
+                  "category": ["IoT & Automation"],
+                  "device": "StickC-Plus2",
+                  "version": "2.1.4",
+                  "download": "firmware/uiflow2_stickc_plus2.bin",
+                  "cover": "cover/uiflow2.png",
+                  "keywords": ["UIFlow2", "MicroPython"]
+                }
+              ]
+            }
+        """.trimIndent()
+        val items = engine.parseM5BurnerFeed(cdnPayload, "repo_m5burner")
+        assertEquals(1, items.size)
+        assertEquals("repo_m5burner_fw_9001", items.first().id)
+        assertEquals("https://m5burner-cdn.m5stack.com/firmware/uiflow2_stickc_plus2.bin", items.first().downloadUrl)
+        assertEquals("https://m5burner-cdn.m5stack.com/cover/uiflow2.png", items.first().coverImageUrl)
+        assertTrue(items.first().description.contains("Tags: UIFlow2, MicroPython"))
+    }
 }

@@ -43,7 +43,7 @@ class FirmwareCatalogEngine(
         RepoSourceEntity(
             id = "repo_m5burner",
             name = "M5Burner Public Feed",
-            url = "https://burner.m5stack.com/api/v1/firmware",
+            url = M5BURNER_API_URL,
             parserType = RepoParserType.M5BURNER.name,
             enabled = true,
             lastSyncedAt = 0L,
@@ -113,10 +113,18 @@ class FirmwareCatalogEngine(
     )
 
     suspend fun ensureDefaultReposSeeded() = withContext(Dispatchers.IO) {
-        val existingIds = repoDao.getEnabled().map { it.id }.toSet()
-        val missing = defaultRepositories.filter { it.id !in existingIds }
-        if (missing.isNotEmpty()) {
-            repoDao.upsertAll(missing)
+        val existingById = repoDao.getAll().associateBy { it.id }
+        val toUpsert = mutableListOf<RepoSourceEntity>()
+        defaultRepositories.forEach { defaultRepo ->
+            val current = existingById[defaultRepo.id]
+            if (current == null) {
+                toUpsert.add(defaultRepo)
+            } else if (defaultRepo.id == "repo_m5burner" && current.url != M5BURNER_API_URL) {
+                toUpsert.add(current.copy(url = M5BURNER_API_URL, lastError = null))
+            }
+        }
+        if (toUpsert.isNotEmpty()) {
+            repoDao.upsertAll(toUpsert)
         }
     }
 
@@ -504,8 +512,10 @@ class FirmwareCatalogEngine(
                 val root = JSONObject(json)
                 root.optJSONArray("data")
                     ?: root.optJSONArray("firmwares")
+                    ?: root.optJSONArray("rows")
                     ?: root.optJSONArray("list")
                     ?: root.optJSONArray("items")
+                    ?: root.optJSONArray("result")
                     ?: flattenCategoryObjectArrays(root)
                     ?: JSONArray().apply { put(root) }
             }
@@ -513,11 +523,16 @@ class FirmwareCatalogEngine(
         val items = mutableListOf<FirmwareEntity>()
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: continue
+            val rawFid = obj.optString("fid").ifBlank { obj.optString("_id") }.ifBlank { obj.optString("id") }
             val name = obj.optString("name").ifBlank { obj.optString("title", "Firmware #$i") }
-            val author = obj.optString("author").ifBlank { obj.optString("published_by", "M5Stack Community") }
-            val category = FirmwareCategory.fromString(
-                obj.optString("category").ifBlank { obj.optString("firmware_category") }
-            ).label
+            val author = obj.optString("author")
+                .ifBlank { obj.optString("published_by") }
+                .ifBlank { obj.optString("publisher", "M5Stack Community") }
+
+            val rawCategory = obj.optJSONArray("category")?.optString(0).orEmpty()
+                .ifBlank { obj.optString("category").takeIf { !it.startsWith("[") }.orEmpty() }
+                .ifBlank { obj.optString("firmware_category").takeIf { !it.startsWith("[") }.orEmpty() }
+            val category = FirmwareCategory.fromString(rawCategory).label
 
             val devicesList = mutableListOf<String>()
             listOf("device", "devices", "board", "boards", "target", "targets").forEach { key ->
@@ -550,7 +565,9 @@ class FirmwareCatalogEngine(
                         if (versionDownloadUrl.isBlank()) {
                             versionDownloadUrl = vObj.optString("download_url")
                                 .ifBlank { vObj.optString("url") }
+                                .ifBlank { vObj.optString("download") }
                                 .ifBlank { vObj.optString("file") }
+                                .ifBlank { vObj.optString("path") }
                         }
                         if (versionFileOffset.isBlank()) {
                             versionFileOffset = vObj.optString("offset").ifBlank { vObj.optString("address") }
@@ -584,30 +601,47 @@ class FirmwareCatalogEngine(
 
             val rawDownloadUrl = obj.optString("download_url")
                 .ifBlank { obj.optString("url") }
+                .ifBlank { obj.optString("download") }
                 .ifBlank { obj.optString("bin_url") }
                 .ifBlank { obj.optString("file") }
+                .ifBlank { obj.optString("path") }
                 .ifBlank { versionDownloadUrl }
                 .ifBlank { firstFilePath }
             if (rawDownloadUrl.isBlank()) continue
-            val downloadUrl = if (rawDownloadUrl.startsWith("http://") || rawDownloadUrl.startsWith("https://")) {
-                rawDownloadUrl
-            } else {
-                "https://m5burner-cdn.m5stack.com/firmware/${rawDownloadUrl.trimStart('/')}"
+            val downloadUrl = when {
+                rawDownloadUrl.startsWith("http://") || rawDownloadUrl.startsWith("https://") -> rawDownloadUrl
+                rawDownloadUrl.trimStart('/').startsWith("firmware/") ->
+                    "https://m5burner-cdn.m5stack.com/${rawDownloadUrl.trimStart('/')}"
+                else -> "https://m5burner-cdn.m5stack.com/firmware/${rawDownloadUrl.trimStart('/')}"
             }
 
             val rawCoverUrl = obj.optString("cover")
                 .ifBlank { obj.optString("cover_image") }
                 .ifBlank { obj.optString("image") }
-                .takeIf { it.isNotBlank() }
+                .ifBlank { obj.optString("icon") }
+                .takeIf { it.isNotBlank() && it != "null" }
             val coverUrl = rawCoverUrl?.let {
-                if (it.startsWith("http://") || it.startsWith("https://")) it
-                else "https://m5burner-cdn.m5stack.com/cover/${it.trimStart('/')}"
+                when {
+                    it.startsWith("http://") || it.startsWith("https://") -> it
+                    it.trimStart('/').startsWith("cover/") -> "https://m5burner-cdn.m5stack.com/${it.trimStart('/')}"
+                    else -> "https://m5burner-cdn.m5stack.com/cover/${it.trimStart('/')}"
+                }
+            }
+
+            val keywordsText = obj.optJSONArray("keywords")?.let { arr ->
+                (0 until arr.length()).mapNotNull { idx -> arr.optString(idx).takeIf { s -> s.isNotBlank() } }.joinToString(", ")
+            } ?: obj.optString("keywords").takeIf { !it.startsWith("[") }.orEmpty()
+            val baseDesc = obj.optString("description").ifBlank { "M5Burner firmware package." }
+            val fullDesc = if (keywordsText.isNotBlank() && !baseDesc.contains(keywordsText, ignoreCase = true)) {
+                "$baseDesc\nTags: $keywordsText"
+            } else {
+                baseDesc
             }
 
             val firstBoard = HardwareRegistry.findById(deviceCsv.substringBefore(",").trim())
             items.add(
                 FirmwareEntity(
-                    id = "${repoId}_${name.hashCode()}_$i",
+                    id = "${repoId}_${rawFid.ifBlank { "${name.hashCode()}_$i" }}",
                     title = name,
                     author = author,
                     category = category,
@@ -616,7 +650,7 @@ class FirmwareCatalogEngine(
                     version = primaryVersion,
                     availableVersionsCsv = versionsCsv,
                     framework = obj.optString("framework").ifBlank { "ESP-IDF / Arduino" },
-                    description = obj.optString("description").ifBlank { "M5Burner / bmorcelli community firmware package." },
+                    description = fullDesc,
                     coverImageUrl = coverUrl,
                     downloadUrl = downloadUrl,
                     localFilePath = null,
@@ -938,5 +972,9 @@ class FirmwareCatalogEngine(
             if (c.moveToFirst()) return c.getString(0)
         }
         return uri.lastPathSegment
+    }
+
+    companion object {
+        const val M5BURNER_API_URL = "http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware"
     }
 }

@@ -101,6 +101,9 @@ interface RepoSourceDao {
     @Query("SELECT * FROM repo_sources ORDER BY name ASC")
     fun observeAll(): Flow<List<RepoSourceEntity>>
 
+    @Query("SELECT * FROM repo_sources")
+    suspend fun getAll(): List<RepoSourceEntity>
+
     @Query("SELECT * FROM repo_sources WHERE enabled = 1")
     suspend fun getEnabled(): List<RepoSourceEntity>
 
