@@ -5,6 +5,7 @@ import com.example.data.local.AppDatabase
 import com.example.data.local.SettingsStore
 import com.example.data.local.TaxonomyRepository
 import com.example.engine.FirmwareCatalogEngine
+import com.example.engine.FirmwareIntegrityService
 import com.example.engine.FlashProtocolEngine
 import com.example.engine.ScriptRepository
 import com.example.engine.TransportManager
@@ -15,15 +16,18 @@ class AppContainer(context: Context) {
     val settingsStore: SettingsStore = SettingsStore(appContext)
     val taxonomyRepository: TaxonomyRepository = TaxonomyRepository(database.taxonomyDao())
     val transportManager: TransportManager = TransportManager(appContext, settingsStore)
+    val firmwareIntegrityService: FirmwareIntegrityService = FirmwareIntegrityService()
     val firmwareCatalogEngine: FirmwareCatalogEngine = FirmwareCatalogEngine(
         context = appContext,
         firmwareDao = database.firmwareDao(),
         repoDao = database.repoSourceDao(),
         taxonomyRepository = taxonomyRepository,
+        integrityService = firmwareIntegrityService,
     )
     val flashProtocolEngine: FlashProtocolEngine = FlashProtocolEngine(
         context = appContext,
         transport = transportManager,
+        integrityService = firmwareIntegrityService,
     )
     val scriptRepository: ScriptRepository = ScriptRepository(
         context = appContext,

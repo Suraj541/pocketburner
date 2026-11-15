@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.AppContainer
+import com.example.data.local.CatalogSection
 import com.example.data.local.CategoryEntity
 import com.example.data.local.DeviceSeriesWithDevices
 import com.example.data.local.DownloadState
@@ -13,6 +14,8 @@ import com.example.data.local.RepoParserType
 import com.example.data.local.RepoSourceEntity
 import com.example.engine.ActiveConnection
 import com.example.engine.FlashOptions
+import com.example.engine.IntegrityVerificationReport
+import com.example.hardware.DeviceFamily
 import com.example.hardware.FirmwareCategory
 import com.example.hardware.HardwareBoardSpec
 import java.io.File
@@ -39,15 +42,22 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
 
     private val catalog = container.firmwareCatalogEngine
     private val flashEngine = container.flashProtocolEngine
+    private val integrityService = container.firmwareIntegrityService
     private val firmwareDao = container.database.firmwareDao()
     private val repoDao = container.database.repoSourceDao()
     private val taxonomyRepo = container.taxonomyRepository
+
+    val integrityReports: StateFlow<Map<String, IntegrityVerificationReport>> =
+        integrityService.reportsByPath
 
     val categories: StateFlow<List<CategoryEntity>> = taxonomyRepo.categories
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val deviceHierarchy: StateFlow<List<DeviceSeriesWithDevices>> = taxonomyRepo.seriesWithDevices
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _selectedSection = MutableStateFlow(CatalogSection.ALL)
+    val selectedSection: StateFlow<CatalogSection> = _selectedSection.asStateFlow()
 
     private val _selectedCategory = MutableStateFlow(FirmwareCategory.ALL)
     val selectedCategory: StateFlow<FirmwareCategory> = _selectedCategory.asStateFlow()
@@ -78,7 +88,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
     val repos: StateFlow<List<RepoSourceEntity>> = repoDao.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Offline-capable Room relational query + instant text search
+    // Offline-capable Room relational query + section + instant text search
     val filteredFirmwares: StateFlow<List<FirmwareEntity>> = combine(
         _selectedCategory,
         _selectedDevice,
@@ -92,12 +102,34 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
             categoryLabel = category.label,
             deviceId = deviceFilter,
         )
+    }.combine(_selectedSection) { items, section ->
+        when (section) {
+            CatalogSection.ALL -> items
+            CatalogSection.MICROCONTROLLERS -> items.filter { item ->
+                item.family != DeviceFamily.RASPBERRY_PI.name ||
+                    item.deviceTagsCsv.contains("Pico", ignoreCase = true)
+            }
+            CatalogSection.OPERATING_SYSTEMS -> items.filter { item ->
+                item.repoSourceId == "repo_rpi_imager" ||
+                    (item.family == DeviceFamily.RASPBERRY_PI.name &&
+                        !item.deviceTagsCsv.contains("Pico", ignoreCase = true)) ||
+                    item.flashMode.contains("Raw Block", ignoreCase = true)
+            }
+            CatalogSection.FIRMWARE_RELEASES -> items.filter { item ->
+                item.repoSourceId != "repo_rpi_imager" &&
+                    !item.framework.startsWith("Board Package", ignoreCase = true)
+            }
+            CatalogSection.VERIFICATION -> items.filter { item ->
+                !item.sha256.isNullOrBlank()
+            }
+        }
     }.combine(_searchQuery) { items, query ->
         val q = query.trim().lowercase()
         if (q.isBlank()) items
         else items.filter { item ->
             item.title.lowercase().contains(q) ||
                 item.author.lowercase().contains(q) ||
+                item.vendor.lowercase().contains(q) ||
                 item.description.lowercase().contains(q) ||
                 item.deviceTagsCsv.lowercase().contains(q) ||
                 item.framework.lowercase().contains(q)
@@ -110,6 +142,10 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
             catalog.ensureDefaultReposSeeded()
             syncAllRepos()
         }
+    }
+
+    fun selectSection(section: CatalogSection) {
+        _selectedSection.value = section
     }
 
     fun selectCategory(category: FirmwareCategory) {
@@ -253,6 +289,16 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    fun verifyDownloadedFirmware(item: FirmwareEntity) {
+        val localPath = item.localFilePath ?: return
+        viewModelScope.launch {
+            integrityService.verifyBeforeFlash(
+                file = File(localPath),
+                expectedSha256 = item.sha256,
+            )
+        }
+    }
+
     fun flashFirmware(item: FirmwareEntity, board: HardwareBoardSpec, options: FlashOptions) {
         val localPath = item.localFilePath
         if (localPath.isNullOrBlank()) {
@@ -265,11 +311,41 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
             )
             return
         }
+        val file = File(localPath)
+        val optionsWithExpectedSha = options.copy(
+            expectedSha256 = options.expectedSha256 ?: item.sha256,
+        )
         viewModelScope.launch {
-            _flashSession.value = FlashSessionState(isFlashing = true, progress = 0.02f, statusText = "Initializing flash...")
-            if (options.eraseBeforeFlash && board.protocol == com.example.hardware.FlashProtocol.ESPTOOL_SLIP) {
+            _flashSession.value = FlashSessionState(
+                isFlashing = true,
+                progress = 0.01f,
+                statusText = "Verifying SHA-256 binary integrity...",
+            )
+            val integrityRes = integrityService.verifyBeforeFlash(
+                file = file,
+                expectedSha256 = optionsWithExpectedSha.expectedSha256,
+                requireExpectedHash = optionsWithExpectedSha.requireExpectedSha256,
+            ) { frac, msg ->
+                _flashSession.value = FlashSessionState(
+                    isFlashing = true,
+                    progress = 0.01f + frac * 0.04f,
+                    statusText = msg,
+                )
+            }
+            if (integrityRes.isFailure) {
+                _flashSession.value = FlashSessionState(
+                    isFlashing = false,
+                    progress = 0f,
+                    statusText = "SHA-256 Integrity Failed",
+                    resultMessage = integrityRes.exceptionOrNull()?.message,
+                    isError = true,
+                )
+                return@launch
+            }
+
+            if (optionsWithExpectedSha.eraseBeforeFlash && board.protocol == com.example.hardware.FlashProtocol.ESPTOOL_SLIP) {
                 val eraseRes = flashEngine.eraseEspFlash(board) { p, msg ->
-                    _flashSession.value = FlashSessionState(isFlashing = true, progress = p * 0.2f, statusText = msg)
+                    _flashSession.value = FlashSessionState(isFlashing = true, progress = 0.05f + p * 0.15f, statusText = msg)
                 }
                 if (eraseRes.isFailure) {
                     _flashSession.value = FlashSessionState(
@@ -282,7 +358,7 @@ class BurnerViewModel(private val container: AppContainer) : ViewModel() {
                     return@launch
                 }
             }
-            val res = flashEngine.flashFirmware(File(localPath), board, options) { p, msg ->
+            val res = flashEngine.flashFirmware(file, board, optionsWithExpectedSha) { p, msg ->
                 _flashSession.value = FlashSessionState(isFlashing = true, progress = p, statusText = msg)
             }
             _flashSession.value = res.fold(

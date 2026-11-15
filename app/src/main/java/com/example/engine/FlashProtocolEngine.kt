@@ -28,11 +28,14 @@ data class FlashOptions(
     val flashMode: String,
     val eraseBeforeFlash: Boolean = false,
     val rpiConfig: RpiHeadlessConfig? = null,
+    val expectedSha256: String? = null,
+    val requireExpectedSha256: Boolean = false,
 )
 
 class FlashProtocolEngine(
     private val context: Context,
     private val transport: TransportManager,
+    private val integrityService: FirmwareIntegrityService = FirmwareIntegrityService(),
 ) {
     suspend fun flashFirmware(
         file: File,
@@ -49,6 +52,19 @@ class FlashProtocolEngine(
                 IllegalStateException("Connect a ${board.displayName} via USB OTG, Wi-Fi, or BLE before flashing.")
             )
         }
+
+        val integrityResult = integrityService.verifyBeforeFlash(
+            file = file,
+            expectedSha256 = options.expectedSha256,
+            requireExpectedHash = options.requireExpectedSha256,
+        ) { frac, msg ->
+            onProgress(0.01f + frac * 0.03f, msg)
+        }
+        val report = integrityResult.getOrElse { err ->
+            transport.appendLog(LogDirection.ERR, err.message ?: "Firmware SHA-256 verification failed.")
+            return@withContext Result.failure(err)
+        }
+        transport.appendLog(LogDirection.SYS, report.summary)
 
         transport.setFlashingMode(true)
         try {

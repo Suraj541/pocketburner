@@ -5,7 +5,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -45,6 +47,8 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -82,6 +86,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -89,12 +94,17 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import com.example.R
+import com.example.data.local.CatalogSection
+import com.example.data.local.CategoryEntity
 import com.example.data.local.DownloadState
 import com.example.data.local.FirmwareEntity
 import com.example.data.local.RepoParserType
 import com.example.data.local.RepoSourceEntity
 import com.example.engine.ActiveConnection
 import com.example.engine.FlashOptions
+import com.example.engine.IntegrityStatus
+import com.example.engine.IntegrityVerificationReport
 import com.example.engine.RpiHeadlessConfig
 import com.example.hardware.DeviceFamily
 import com.example.hardware.FirmwareCategory
@@ -117,6 +127,7 @@ fun BurnerScreen(
     val repos by viewModel.repos.collectAsStateWithLifecycle()
     val categories by viewModel.categories.collectAsStateWithLifecycle()
     val deviceHierarchy by viewModel.deviceHierarchy.collectAsStateWithLifecycle()
+    val selectedSection by viewModel.selectedSection.collectAsStateWithLifecycle()
     val selectedCategory by viewModel.selectedCategory.collectAsStateWithLifecycle()
     val selectedSeriesId by viewModel.selectedSeriesId.collectAsStateWithLifecycle()
     val selectedDevice by viewModel.selectedDevice.collectAsStateWithLifecycle()
@@ -126,15 +137,17 @@ fun BurnerScreen(
     val syncMessage by viewModel.syncMessage.collectAsStateWithLifecycle()
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
     val flashSession by viewModel.flashSession.collectAsStateWithLifecycle()
+    val integrityReports by viewModel.integrityReports.collectAsStateWithLifecycle()
 
     var showAddFirmwareDialog by remember { mutableStateOf(false) }
     var showRepoManagerDialog by remember { mutableStateOf(false) }
     var showBoardSpecsForId by remember { mutableStateOf<String?>(null) }
     var firmwareToFlash by remember { mutableStateOf<FirmwareEntity?>(null) }
+    var firmwareToVerify by remember { mutableStateOf<FirmwareEntity?>(null) }
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Studio Header
+            // Top Hardware & OS Download Center Header
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -143,14 +156,38 @@ fun BurnerScreen(
                     .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("PocketBurner", style = MaterialTheme.typography.headlineSmall)
+                    Text("Hardware & OS Center", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Text(
-                        "M5Stack • All ESP IoT • Arduino • Raspberry Pi",
+                        "Microcontrollers • Raspberry Pi OS • Verified Releases",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 ConnectionStatusPill(connectionState = connectionState, onClick = onNavigateConnect)
+            }
+
+            // Hub Section Strip (Microcontrollers / Operating Systems / Firmware Releases / Verification)
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .padding(bottom = 8.dp)
+                    .testTag("hub_sections_row"),
+            ) {
+                items(CatalogSection.entries) { section ->
+                    FilterChip(
+                        selected = selectedSection == section,
+                        onClick = { viewModel.selectSection(section) },
+                        leadingIcon = if (section == CatalogSection.VERIFICATION) {
+                            { Icon(Icons.Filled.VerifiedUser, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                        } else null,
+                        label = { Text(section.label, style = MaterialTheme.typography.labelLarge) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                        ),
+                    )
+                }
             }
 
             // Search + Toolbar
@@ -367,6 +404,7 @@ fun BurnerScreen(
                                     val firstDev = item.deviceTagsCsv.substringBefore(",").trim()
                                     showBoardSpecsForId = firstDev.ifBlank { "CoreS3" }
                                 },
+                                onInspectVerification = { firmwareToVerify = item },
                             )
                         }
                     }
@@ -445,6 +483,15 @@ fun BurnerScreen(
             onEraseFlash = { board -> viewModel.eraseBoardFlash(board) },
         )
     }
+
+    firmwareToVerify?.let { fw ->
+        FirmwareProvenanceDialog(
+            firmware = fw,
+            integrityReport = fw.localFilePath?.let { integrityReports[it] },
+            onVerifyBinary = { viewModel.verifyDownloadedFirmware(fw) },
+            onDismiss = { firmwareToVerify = null },
+        )
+    }
 }
 
 @Composable
@@ -497,35 +544,45 @@ private fun FirmwareShowcaseCard(
     onFlash: () -> Unit,
     onDeleteDownload: () -> Unit,
     onInspectBoard: () -> Unit,
+    onInspectVerification: () -> Unit,
 ) {
     val statusColors = LocalHardwareStatusColors.current
     val dlState = runCatching { DownloadState.valueOf(item.downloadState) }.getOrDefault(DownloadState.NOT_DOWNLOADED)
     val family = runCatching { DeviceFamily.valueOf(item.family) }.getOrDefault(DeviceFamily.ESP_IOT)
+    val fallbackDrawableRes = remember(family, item.category, item.title) {
+        when {
+            item.category.contains("Launcher", ignoreCase = true) ||
+                item.title.contains("Launcher", ignoreCase = true) -> R.drawable.img_fw_launcher_ota
+            family == DeviceFamily.M5STACK -> R.drawable.img_fw_m5stack
+            family == DeviceFamily.ARDUINO -> R.drawable.img_fw_arduino
+            family == DeviceFamily.RASPBERRY_PI -> R.drawable.img_fw_rpi_os
+            else -> R.drawable.img_fw_esp_iot
+        }
+    }
+    val isOfficial = item.sourceType.equals("official", ignoreCase = true) && !item.isCustomUserAdded
+    val publisherLabel = item.vendor.ifBlank { item.author }
 
     ElevatedCard(
         shape = RoundedCornerShape(18.dp),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 3.dp),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("firmware_card_${item.id}"),
     ) {
         Column {
-            // Cover Image / Hardware Family Banner
+            // Bundled Hardware/Firmware Artwork + Optional Remote Cover Image
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(112.dp)
-                    .background(
-                        Brush.linearGradient(
-                            when (family) {
-                                DeviceFamily.M5STACK -> listOf(Color(0xFF0B2545), Color(0xFF1E6091))
-                                DeviceFamily.ESP_IOT -> listOf(Color(0xFF183A37), Color(0xFF2B7A78))
-                                DeviceFamily.ARDUINO -> listOf(Color(0xFF004E59), Color(0xFF008184))
-                                DeviceFamily.RASPBERRY_PI -> listOf(Color(0xFF590D22), Color(0xFFA4133C))
-                            }
-                        )
-                    ),
+                    .height(140.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
             ) {
+                Image(
+                    painter = painterResource(id = fallbackDrawableRes),
+                    contentDescription = item.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
                 if (!item.coverImageUrl.isNullOrBlank()) {
                     AsyncImage(
                         model = item.coverImageUrl,
@@ -533,21 +590,29 @@ private fun FirmwareShowcaseCard(
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
                     )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.35f)),
-                    )
                 }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.Black.copy(alpha = 0.50f),
+                                    Color.Black.copy(alpha = 0.15f),
+                                    Color.Black.copy(alpha = 0.72f),
+                                )
+                            )
+                        ),
+                )
                 Row(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.Top,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(12.dp),
+                        .padding(10.dp),
                 ) {
                     Surface(
-                        color = Color.Black.copy(alpha = 0.55f),
+                        color = Color.Black.copy(alpha = 0.62f),
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text(
@@ -558,7 +623,7 @@ private fun FirmwareShowcaseCard(
                         )
                     }
                     Surface(
-                        color = if (item.isCustomUserAdded) MaterialTheme.colorScheme.tertiary else Color.Black.copy(alpha = 0.55f),
+                        color = if (item.isCustomUserAdded) MaterialTheme.colorScheme.tertiary else Color.Black.copy(alpha = 0.62f),
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text(
@@ -569,27 +634,83 @@ private fun FirmwareShowcaseCard(
                         )
                     }
                 }
-                Text(
-                    text = item.framework,
-                    style = MonoTextStyles.HexBadge.copy(color = Color.White.copy(alpha = 0.92f)),
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
-                        .padding(12.dp),
-                )
+                        .fillMaxWidth()
+                        .padding(10.dp),
+                ) {
+                    Text(
+                        text = item.framework,
+                        style = MonoTextStyles.HexBadge.copy(color = Color.White.copy(alpha = 0.95f)),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Surface(
+                        color = if (isOfficial) statusColors.connected else Color(0xFF3A2E14).copy(alpha = 0.90f),
+                        shape = RoundedCornerShape(8.dp),
+                        onClick = onInspectVerification,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        ) {
+                            Icon(
+                                imageVector = if (isOfficial) Icons.Filled.VerifiedUser else Icons.Filled.Security,
+                                contentDescription = "Verify firmware provenance",
+                                tint = Color.White,
+                                modifier = Modifier.size(13.dp),
+                            )
+                            Text(
+                                text = if (isOfficial) "Official" else "Community",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.White,
+                            )
+                        }
+                    }
+                }
             }
 
             Column(modifier = Modifier.padding(14.dp)) {
                 Text(
                     text = item.title,
                     style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Text(
-                    text = "by ${item.author}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = publisherLabel,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (!item.sha256.isNullOrBlank()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.clickable(onClick = onInspectVerification),
+                        ) {
+                            Text(
+                                text = "SHA-256",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                }
                 Spacer(Modifier.height(6.dp))
                 Text(
                     text = item.description,
@@ -1104,6 +1225,35 @@ private fun FlashConsoleDialog(
                     }
                 }
 
+                val hasSha = !firmware.sha256.isNullOrBlank()
+                Surface(
+                    color = if (hasSha) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                    else MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (hasSha) Icons.Filled.VerifiedUser else Icons.Filled.Security,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Text(
+                            text = if (hasSha) {
+                                "Pre-flash SHA-256 check enabled (${firmware.sha256?.take(12)}…)"
+                            } else {
+                                "SHA-256 digest will be computed before flashing"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                }
+
                 if (flashSession.isFlashing || flashSession.resultMessage != null) {
                     HorizontalDivider()
                     LinearProgressIndicator(progress = { flashSession.progress }, modifier = Modifier.fillMaxWidth())
@@ -1154,6 +1304,96 @@ private fun FlashConsoleDialog(
                 }
                 TextButton(onClick = onDismiss) { Text("Close") }
             }
+        },
+    )
+}
+
+@Composable
+private fun FirmwareProvenanceDialog(
+    firmware: FirmwareEntity,
+    integrityReport: IntegrityVerificationReport?,
+    onVerifyBinary: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val isOfficial = firmware.sourceType.equals("official", ignoreCase = true) && !firmware.isCustomUserAdded
+    val isDownloaded = firmware.downloadState == DownloadState.DOWNLOADED.name && !firmware.localFilePath.isNullOrBlank()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(
+                    imageVector = if (isOfficial) Icons.Filled.VerifiedUser else Icons.Filled.Security,
+                    contentDescription = null,
+                    tint = if (isOfficial) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+                )
+                Text("Source & Checksum Verification", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Text(firmware.title, style = MaterialTheme.typography.titleMedium)
+                Text("Publisher / Vendor: ${firmware.vendor.ifBlank { firmware.author }}", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Classification: ${if (isOfficial) "Official Vendor Package" else "Community / Third-Party Build (unverified by vendor)"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isOfficial) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+                )
+                Text("Version: ${firmware.version}${if (firmware.releaseDate.isNotBlank()) " • Released ${firmware.releaseDate}" else ""}", style = MaterialTheme.typography.bodySmall)
+                Text("Compatible Boards: ${firmware.deviceTagsCsv}", style = MaterialTheme.typography.bodySmall)
+                HorizontalDivider()
+                Text("Expected SHA-256 Checksum:", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    text = firmware.sha256?.takeIf { it.isNotBlank() } ?: "Not supplied by upstream feed (verify manually before flashing).",
+                    style = MonoTextStyles.HexBadge,
+                )
+                if (integrityReport != null) {
+                    val badgeColor = when (integrityReport.status) {
+                        IntegrityStatus.VERIFIED -> MaterialTheme.colorScheme.secondaryContainer
+                        IntegrityStatus.MISMATCH, IntegrityStatus.MISSING_FILE, IntegrityStatus.ERROR ->
+                            MaterialTheme.colorScheme.errorContainer
+                        IntegrityStatus.COMPUTED_NO_EXPECTED -> MaterialTheme.colorScheme.tertiaryContainer
+                    }
+                    Surface(
+                        color = badgeColor,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(
+                                    imageVector = if (integrityReport.status == IntegrityStatus.VERIFIED) Icons.Filled.CheckCircle else Icons.Filled.Security,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Text(integrityReport.status.label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            }
+                            Text(integrityReport.summary, style = MaterialTheme.typography.bodySmall)
+                            integrityReport.actualSha256?.let { computed ->
+                                Text("Computed SHA-256: $computed", style = MonoTextStyles.HexBadge)
+                            }
+                        }
+                    }
+                }
+                if (isDownloaded) {
+                    FilledTonalButton(
+                        onClick = onVerifyBinary,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("verify_binary_sha256_button"),
+                    ) {
+                        Icon(Icons.Filled.VerifiedUser, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Verify Downloaded Binary (SHA-256)")
+                    }
+                }
+                Text("Source URL:", style = MaterialTheme.typography.labelMedium)
+                Text(firmware.sourceUrl.ifBlank { firmware.downloadUrl }, style = MonoTextStyles.HexBadge)
+                Text("Download URL:", style = MaterialTheme.typography.labelMedium)
+                Text(firmware.downloadUrl, style = MonoTextStyles.HexBadge)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
         },
     )
 }

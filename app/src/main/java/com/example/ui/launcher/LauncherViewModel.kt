@@ -266,6 +266,7 @@ class LauncherViewModel(private val container: AppContainer) : ViewModel() {
                     flashOffsetHex = effectiveOffset,
                     flashMode = board.flashMode,
                     eraseBeforeFlash = false,
+                    expectedSha256 = fw.sha256,
                 ),
             )
         } else {
@@ -280,6 +281,7 @@ class LauncherViewModel(private val container: AppContainer) : ViewModel() {
                     offsetHex = effectiveOffset,
                     flashMode = board.flashMode,
                     eraseBefore = false,
+                    expectedSha256 = fw.sha256,
                 ),
             )
         }
@@ -299,6 +301,7 @@ class LauncherViewModel(private val container: AppContainer) : ViewModel() {
         val activeWifiHost = (connectionState.value as? ActiveConnection.WifiConnected)?.host
             ?: networkEndpoints.value.firstOrNull()?.host
         val config = parseTargetConfig(targetBaseUrl, protocol, fallbackHost = activeWifiHost)
+            .copy(expectedSha256 = fw.sha256)
         val file = File(path)
         val svc = boundWifiOtaService
         if (svc != null) {

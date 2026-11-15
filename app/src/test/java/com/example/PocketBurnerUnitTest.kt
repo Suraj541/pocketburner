@@ -577,5 +577,223 @@ class PocketBurnerUnitTest {
         assertEquals("https://m5burner-cdn.m5stack.com/firmware/uiflow2_stickc_plus2.bin", items.first().downloadUrl)
         assertEquals("https://m5burner-cdn.m5stack.com/cover/uiflow2.png", items.first().coverImageUrl)
         assertTrue(items.first().description.contains("Tags: UIFlow2, MicroPython"))
+        assertEquals("official", items.first().sourceType)
+    }
+
+    @Test
+    fun retrofitCatalogService_fetchesApiFirmwareSavesIntoRoomAndSeparatesThirdPartyOsVendors() = kotlinx.coroutines.test.runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val container = AppContainer.getInstance(context)
+
+        val expectedIds = listOf(
+            "repo_m5burner", "repo_rpi_imager", "repo_espressif_esp32", "repo_esp8266_core",
+            "repo_arduino_index", "repo_adafruit_index", "repo_espidf_releases", "repo_wled_esp",
+            "repo_tasmota_esp", "repo_esphome_releases", "repo_micropython_esp_rp", "repo_meshtastic_esp",
+        )
+        expectedIds.forEach { repoId ->
+            assertTrue(
+                "Missing default repository $repoId",
+                container.firmwareCatalogEngine.defaultRepositories.any { it.id == repoId },
+            )
+        }
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val mockApiPayload = """
+            [
+              {
+                "fid": "retro_1",
+                "name": "RetroBurner Scanner",
+                "author": "CommunityDev",
+                "category": "Security Research",
+                "device": ["Cardputer", "CoreS3"],
+                "version": "1.5.0",
+                "sha256": "deadbeef0123456789",
+                "download_url": "https://m5burner-cdn.m5stack.com/firmware/retro_scanner.bin",
+                "cover": "retro_cover.png",
+                "updated_at": "2026-10-01T00:00:00Z"
+              }
+            ]
+        """.trimIndent()
+        server.createContext("/api/firmware") { exchange ->
+            val bytes = mockApiPayload.toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+
+        try {
+            val port = server.address.port
+            val okHttp = okhttp3.OkHttpClient.Builder().build()
+            val retrofitApi = com.example.data.remote.FirmwareCatalogApiService.create(
+                client = okHttp,
+                baseUrl = "http://127.0.0.1:$port/",
+            )
+            val engine = com.example.engine.FirmwareCatalogEngine(
+                context = context,
+                firmwareDao = container.database.firmwareDao(),
+                repoDao = container.database.repoSourceDao(),
+                taxonomyRepository = container.taxonomyRepository,
+                customApiService = retrofitApi,
+            )
+
+            val retrofitRepo = engine.defaultRepositories.first { it.id == "repo_m5burner" }
+                .copy(url = "http://127.0.0.1:$port/api/firmware")
+            val syncResult = engine.syncSingleRepo(retrofitRepo)
+            assertTrue("Expected Retrofit sync success, got ${syncResult.exceptionOrNull()}", syncResult.isSuccess)
+            assertEquals(1, syncResult.getOrThrow())
+
+            val saved = container.database.firmwareDao().getById("repo_m5burner_retro_1")
+            assertNotNull(saved)
+            assertEquals("Security Research", saved?.category)
+            assertTrue(saved?.deviceTagsCsv?.contains("Cardputer") == true)
+            assertEquals("CommunityDev", saved?.vendor)
+            assertEquals("community", saved?.sourceType)
+            assertEquals("deadbeef0123456789", saved?.sha256)
+            assertEquals("2026-10-01", saved?.releaseDate)
+
+            val rpiMixedJson = """
+                {
+                  "os_list": [
+                    {
+                      "name": "Raspberry Pi OS (64-bit)",
+                      "description": "Official Debian-based Raspberry Pi OS.",
+                      "url": "https://downloads.raspberrypi.com/raspios_arm64/images/raspios.img.xz",
+                      "extract_sha256": "aaa111bbb222",
+                      "release_date": "2026-09-15",
+                      "devices": ["pi5-64bit", "pi4-64bit"]
+                    },
+                    {
+                      "name": "Other general-purpose OS",
+                      "subitems": [
+                        {
+                          "name": "Ubuntu Desktop 24.04",
+                          "url": "https://cdimage.ubuntu.com/releases/24.04/ubuntu.img.xz",
+                          "extract_sha256": "ccc333ddd444",
+                          "release_date": "2026-08-20"
+                        },
+                        {
+                          "name": "Kali Linux ARM64",
+                          "url": "https://kali.download/arm-images/kali.img.xz",
+                          "release_date": "2026-07-10"
+                        }
+                      ]
+                    }
+                  ]
+                }
+            """.trimIndent()
+            val osItems = engine.parseRpiImagerFeed(rpiMixedJson, "repo_rpi_imager")
+            assertEquals(3, osItems.size)
+            assertEquals("official", osItems[0].sourceType)
+            assertEquals("Raspberry Pi Ltd", osItems[0].vendor)
+            assertEquals("community", osItems[1].sourceType)
+            assertEquals("Canonical / Ubuntu", osItems[1].vendor)
+            assertEquals("community", osItems[2].sourceType)
+            assertEquals("Kali Linux (OffSec)", osItems[2].vendor)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun firmwareIntegrityService_computesVerifiesAndBlocksCorruptBinariesBeforeFlashing() = kotlinx.coroutines.test.runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val container = AppContainer.getInstance(context)
+        val integrity = container.firmwareIntegrityService
+
+        val tempBin = File.createTempFile("pocketburner_integrity_test", ".bin").apply {
+            writeBytes("firmware-payload-v1.2.3".toByteArray(Charsets.UTF_8))
+            deleteOnExit()
+        }
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        var serverHitCount = 0
+        server.createContext("/ota") { exchange ->
+            serverHitCount++
+            exchange.requestBody.readBytes()
+            val reply = "OK".toByteArray()
+            exchange.sendResponseHeaders(200, reply.size.toLong())
+            exchange.responseBody.use { it.write(reply) }
+        }
+        server.start()
+
+        try {
+            val expectedHex = com.example.engine.FirmwareIntegrityService.computeSha256Hex(tempBin.readBytes())
+            val progressSteps = mutableListOf<Float>()
+            val computed = integrity.computeSha256(tempBin) { frac -> progressSteps.add(frac) }
+            assertTrue(computed.isSuccess)
+            assertEquals(expectedHex, computed.getOrThrow())
+            assertTrue(progressSteps.contains(1.0f))
+
+            // Verify prefixed uppercase Arduino-style digest normalization passes
+            val prefixedVerify = integrity.verifyBeforeFlash(tempBin, "SHA-256:${expectedHex.uppercase()}")
+            assertTrue(prefixedVerify.isSuccess)
+            assertEquals(com.example.engine.IntegrityStatus.VERIFIED, prefixedVerify.getOrThrow().status)
+            assertEquals(
+                com.example.engine.IntegrityStatus.VERIFIED,
+                integrity.reportsByPath.value[tempBin.absolutePath]?.status,
+            )
+
+            // Verify missing expected hash passes when optional, blocks when required
+            val optionalMissing = integrity.verifyBeforeFlash(tempBin, null, requireExpectedHash = false)
+            assertTrue(optionalMissing.isSuccess)
+            assertEquals(com.example.engine.IntegrityStatus.COMPUTED_NO_EXPECTED, optionalMissing.getOrThrow().status)
+
+            val strictMissing = integrity.verifyBeforeFlash(tempBin, null, requireExpectedHash = true)
+            assertTrue(strictMissing.isFailure)
+            assertTrue(strictMissing.exceptionOrNull() is com.example.engine.FirmwareIntegrityException)
+
+            // Tamper with expected hash -> FlashProtocolEngine & WifiOtaUploader must both block before flashing
+            val wrongSha = "0".repeat(64)
+            val board = HardwareRegistry.findById("ESP32 DevKit")!!
+            val port = server.address.port
+
+            // Establish a Wi-Fi transport so FlashProtocolEngine reaches the SHA-256 integrity gate
+            val tcpServer = java.net.ServerSocket(0)
+            try {
+                val tcpConnRes = container.transportManager.connectWifi("127.0.0.1", tcpServer.localPort, useTls = false)
+                assertTrue(tcpConnRes.isSuccess)
+
+                val flashAttempt = container.flashProtocolEngine.flashFirmware(
+                    file = tempBin,
+                    board = board,
+                    options = com.example.engine.FlashOptions(
+                        baudRate = 921600,
+                        flashOffsetHex = "0x10000",
+                        flashMode = "DIO",
+                        expectedSha256 = wrongSha,
+                    ),
+                ) { _, _ -> }
+                assertTrue(flashAttempt.isFailure)
+                assertTrue(flashAttempt.exceptionOrNull() is com.example.engine.FirmwareIntegrityException)
+                assertTrue(flashAttempt.exceptionOrNull()?.message?.contains("SHA-256 mismatch") == true)
+            } finally {
+                container.transportManager.disconnect()
+                tcpServer.close()
+            }
+
+            val otaUploader = com.example.engine.WifiOtaUploader(integrityService = integrity)
+            val badOtaConfig = com.example.engine.WifiOtaTargetConfig(
+                useHttps = false,
+                host = "127.0.0.1",
+                port = port,
+                endpointPath = "/ota",
+                protocol = com.example.engine.OtaUploadProtocol.ARDUINO_RAW_BINARY,
+                expectedSha256 = wrongSha,
+            )
+            val blockedOta = otaUploader.pushFirmwareBinary(tempBin, badOtaConfig) { _, _, _ -> }
+            assertTrue(blockedOta.isFailure)
+            assertTrue(blockedOta.exceptionOrNull() is com.example.engine.FirmwareIntegrityException)
+            assertEquals("HTTP OTA upload should not be sent when SHA-256 verification fails", 0, serverHitCount)
+
+            val goodOtaConfig = badOtaConfig.copy(expectedSha256 = expectedHex)
+            val allowedOta = otaUploader.pushFirmwareBinary(tempBin, goodOtaConfig) { _, _, _ -> }
+            assertTrue(allowedOta.isSuccess)
+            assertEquals(1, serverHitCount)
+            assertEquals(expectedHex, allowedOta.getOrThrow().sha256Hex)
+        } finally {
+            server.stop(0)
+            tempBin.delete()
+        }
     }
 }

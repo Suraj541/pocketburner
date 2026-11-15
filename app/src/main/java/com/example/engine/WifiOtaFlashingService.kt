@@ -39,7 +39,8 @@ class WifiOtaFlashingService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private lateinit var transportManager: TransportManager
-    private val otaUploader = WifiOtaUploader()
+    private lateinit var integrityService: FirmwareIntegrityService
+    private lateinit var otaUploader: WifiOtaUploader
 
     private var monitorJob: Job? = null
     private var otaJob: Job? = null
@@ -52,6 +53,8 @@ class WifiOtaFlashingService : Service() {
         super.onCreate()
         val container = AppContainer.getInstance(applicationContext)
         transportManager = container.transportManager
+        integrityService = container.firmwareIntegrityService
+        otaUploader = WifiOtaUploader(integrityService = integrityService)
         ensureNotificationChannel()
         transportManager.setWifiOtaServiceRunning(true)
 
@@ -89,6 +92,7 @@ class WifiOtaFlashingService : Service() {
                 val protocolName = intent.getStringExtra(EXTRA_PROTOCOL) ?: OtaUploadProtocol.ESP_MULTIPART_UPDATE.name
                 val password = intent.getStringExtra(EXTRA_OTA_PASSWORD).orEmpty()
                 val allowSelfSigned = intent.getBooleanExtra(EXTRA_ALLOW_SELF_SIGNED, true)
+                val expectedSha = intent.getStringExtra(EXTRA_EXPECTED_SHA256)
 
                 if (!path.isNullOrBlank()) {
                     val protocol = runCatching { OtaUploadProtocol.valueOf(protocolName) }
@@ -104,6 +108,7 @@ class WifiOtaFlashingService : Service() {
                             protocol = protocol,
                             otaPassword = password,
                             allowSelfSignedTls = allowSelfSigned,
+                            expectedSha256 = expectedSha,
                         ),
                     )
                 }
@@ -206,7 +211,7 @@ class WifiOtaFlashingService : Service() {
 
             val terminalState = result.fold(
                 onSuccess = { outcome ->
-                    val msg = "OTA HTTP ${outcome.httpCode}: Sent ${outcome.bytesSent / 1024} KB (MD5 ${outcome.md5Hex.take(8)}…) • ${outcome.serverResponse}"
+                    val msg = "OTA HTTP ${outcome.httpCode}: Sent ${outcome.bytesSent / 1024} KB (SHA-256 ${outcome.sha256Hex.take(10)}…) • ${outcome.serverResponse}"
                     transportManager.appendLog(LogDirection.SYS, msg)
                     WifiOtaProgressState(
                         isFlashing = false,
@@ -351,6 +356,7 @@ class WifiOtaFlashingService : Service() {
         const val EXTRA_PROTOCOL = "extra_ota_protocol"
         const val EXTRA_OTA_PASSWORD = "extra_ota_password"
         const val EXTRA_ALLOW_SELF_SIGNED = "extra_ota_allow_self_signed"
+        const val EXTRA_EXPECTED_SHA256 = "extra_ota_expected_sha256"
 
         fun createPushIntent(
             context: Context,
@@ -368,6 +374,9 @@ class WifiOtaFlashingService : Service() {
             putExtra(EXTRA_PROTOCOL, config.protocol.name)
             putExtra(EXTRA_OTA_PASSWORD, config.otaPassword)
             putExtra(EXTRA_ALLOW_SELF_SIGNED, config.allowSelfSignedTls)
+            if (!config.expectedSha256.isNullOrBlank()) {
+                putExtra(EXTRA_EXPECTED_SHA256, config.expectedSha256)
+            }
         }
 
         fun startServiceAction(context: Context, intent: Intent) {

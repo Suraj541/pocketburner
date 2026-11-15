@@ -62,6 +62,8 @@ data class WifiOtaTargetConfig(
     val otaPassword: String = "",
     val otaUsername: String = "admin",
     val allowSelfSignedTls: Boolean = true,
+    val expectedSha256: String? = null,
+    val requireExpectedSha256: Boolean = false,
 ) {
     val scheme: String
         get() = if (useHttps) "https" else "http"
@@ -90,6 +92,7 @@ data class OtaUploadOutcome(
 
 class WifiOtaUploader(
     private val customClientFactory: ((WifiOtaTargetConfig) -> OkHttpClient)? = null,
+    private val integrityService: FirmwareIntegrityService = FirmwareIntegrityService(),
 ) {
     @Volatile
     private var activeCall: Call? = null
@@ -133,8 +136,19 @@ class WifiOtaUploader(
         }
 
         val targetUrl = config.buildTargetUrl()
-        onProgress(0L, totalBytes, "Computing MD5 & SHA-256 digests…")
-        val (md5Hex, sha256Hex) = computeDigests(firmwareFile)
+        val verifyRes = integrityService.verifyBeforeFlash(
+            file = firmwareFile,
+            expectedSha256 = config.expectedSha256,
+            requireExpectedHash = config.requireExpectedSha256,
+        ) { _, msg ->
+            onProgress(0L, totalBytes, msg)
+        }
+        val report = verifyRes.getOrElse { err ->
+            return@withContext Result.failure(err)
+        }
+        onProgress(0L, totalBytes, "Computing MD5 digest (SHA-256 ${report.status.label})…")
+        val md5Hex = computeMd5Digest(firmwareFile)
+        val sha256Hex = report.actualSha256 ?: computeDigests(firmwareFile).second
 
         val streamBody = StreamingBinaryRequestBody(
             file = firmwareFile,
@@ -277,6 +291,19 @@ class WifiOtaUploader(
     }
 
     companion object {
+        fun computeMd5Digest(file: File): String {
+            val md5 = MessageDigest.getInstance("MD5")
+            val buf = ByteArray(16 * 1024)
+            FileInputStream(file).use { input ->
+                while (true) {
+                    val read = input.read(buf)
+                    if (read <= 0) break
+                    md5.update(buf, 0, read)
+                }
+            }
+            return md5.digest().joinToString("") { "%02x".format(it) }
+        }
+
         fun computeDigests(file: File): Pair<String, String> {
             val md5 = MessageDigest.getInstance("MD5")
             val sha = MessageDigest.getInstance("SHA-256")

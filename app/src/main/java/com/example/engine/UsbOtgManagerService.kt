@@ -47,6 +47,7 @@ class UsbOtgManagerService : Service() {
 
     private lateinit var transportManager: TransportManager
     private lateinit var flashProtocolEngine: FlashProtocolEngine
+    private lateinit var integrityService: FirmwareIntegrityService
     private lateinit var settingsStore: SettingsStore
 
     private var monitorJob: Job? = null
@@ -67,6 +68,7 @@ class UsbOtgManagerService : Service() {
         val container = AppContainer.getInstance(applicationContext)
         transportManager = container.transportManager
         flashProtocolEngine = container.flashProtocolEngine
+        integrityService = container.firmwareIntegrityService
         settingsStore = container.settingsStore
         ensureNotificationChannel()
         transportManager.setUsbServiceRunning(true)
@@ -142,6 +144,7 @@ class UsbOtgManagerService : Service() {
                 val offset = intent.getStringExtra(EXTRA_OFFSET_HEX) ?: "0x10000"
                 val flashMode = intent.getStringExtra(EXTRA_FLASH_MODE) ?: "DIO"
                 val eraseBefore = intent.getBooleanExtra(EXTRA_ERASE_BEFORE, false)
+                val expectedSha = intent.getStringExtra(EXTRA_EXPECTED_SHA256)
                 val title = intent.getStringExtra(EXTRA_FIRMWARE_TITLE) ?: File(path.orEmpty()).name
 
                 if (!path.isNullOrBlank()) {
@@ -157,6 +160,7 @@ class UsbOtgManagerService : Service() {
                             flashOffsetHex = offset,
                             flashMode = flashMode,
                             eraseBeforeFlash = eraseBefore,
+                            expectedSha256 = expectedSha,
                         ),
                     )
                 }
@@ -223,6 +227,58 @@ class UsbOtgManagerService : Service() {
             return
         }
         flashJob = serviceScope.launch(Dispatchers.IO) {
+            promoteForeground(
+                title = "Verifying $firmwareTitle",
+                text = "Checking SHA-256 binary integrity…",
+                progressPercent = 1,
+                showDisconnect = false,
+            )
+
+            transportManager.updateUsbFlashState(
+                UsbFlashProgressState(
+                    isFlashing = true,
+                    progress = 0.01f,
+                    statusText = "Verifying SHA-256 binary integrity…",
+                    firmwareTitle = firmwareTitle,
+                    boardId = board.id,
+                    baudRate = options.baudRate,
+                )
+            )
+
+            val verifyRes = integrityService.verifyBeforeFlash(
+                file = file,
+                expectedSha256 = options.expectedSha256,
+                requireExpectedHash = options.requireExpectedSha256,
+            ) { frac, msg ->
+                transportManager.updateUsbFlashState(
+                    UsbFlashProgressState(
+                        isFlashing = true,
+                        progress = 0.01f + frac * 0.04f,
+                        statusText = msg,
+                        firmwareTitle = firmwareTitle,
+                        boardId = board.id,
+                        baudRate = options.baudRate,
+                    )
+                )
+            }
+            if (verifyRes.isFailure) {
+                val errMsg = verifyRes.exceptionOrNull()?.message ?: "SHA-256 integrity check failed"
+                transportManager.appendLog(LogDirection.ERR, errMsg)
+                transportManager.updateUsbFlashState(
+                    UsbFlashProgressState(
+                        isFlashing = false,
+                        progress = 0f,
+                        statusText = "SHA-256 Integrity Failed",
+                        firmwareTitle = firmwareTitle,
+                        boardId = board.id,
+                        baudRate = options.baudRate,
+                        resultMessage = errMsg,
+                        isError = true,
+                    )
+                )
+                return@launch
+            }
+
             // Auto-connect first permitted serial device if not currently connected via USB OTG
             if (transportManager.connectionState.value !is ActiveConnection.UsbConnected) {
                 transportManager.refreshUsbDevices()
@@ -240,14 +296,14 @@ class UsbOtgManagerService : Service() {
             promoteForeground(
                 title = "Flashing $firmwareTitle",
                 text = "Preparing ${board.displayName} @ ${options.baudRate} bps",
-                progressPercent = 2,
+                progressPercent = 5,
                 showDisconnect = false,
             )
 
             transportManager.updateUsbFlashState(
                 UsbFlashProgressState(
                     isFlashing = true,
-                    progress = 0.02f,
+                    progress = 0.05f,
                     statusText = "Initializing USB OTG flash pipeline…",
                     firmwareTitle = firmwareTitle,
                     boardId = board.id,
@@ -459,6 +515,7 @@ class UsbOtgManagerService : Service() {
         const val EXTRA_OFFSET_HEX = "extra_usb_offset_hex"
         const val EXTRA_FLASH_MODE = "extra_usb_flash_mode"
         const val EXTRA_ERASE_BEFORE = "extra_usb_erase_before"
+        const val EXTRA_EXPECTED_SHA256 = "extra_usb_expected_sha256"
 
         fun createScanIntent(context: Context): Intent =
             Intent(context, UsbOtgManagerService::class.java).setAction(ACTION_SCAN_SERIAL_DEVICES)
@@ -479,6 +536,7 @@ class UsbOtgManagerService : Service() {
             offsetHex: String,
             flashMode: String,
             eraseBefore: Boolean,
+            expectedSha256: String? = null,
         ): Intent = Intent(context, UsbOtgManagerService::class.java).apply {
             action = ACTION_FLASH_BINARY
             putExtra(EXTRA_FIRMWARE_PATH, firmwarePath)
@@ -488,6 +546,9 @@ class UsbOtgManagerService : Service() {
             putExtra(EXTRA_OFFSET_HEX, offsetHex)
             putExtra(EXTRA_FLASH_MODE, flashMode)
             putExtra(EXTRA_ERASE_BEFORE, eraseBefore)
+            if (!expectedSha256.isNullOrBlank()) {
+                putExtra(EXTRA_EXPECTED_SHA256, expectedSha256)
+            }
         }
 
         fun startServiceAction(context: Context, intent: Intent) {

@@ -29,6 +29,14 @@ enum class TransportType {
     WIFI_TCP_TLS,
 }
 
+enum class CatalogSection(val label: String) {
+    ALL("All Hub"),
+    MICROCONTROLLERS("Microcontrollers"),
+    OPERATING_SYSTEMS("Operating Systems"),
+    FIRMWARE_RELEASES("Firmware Releases"),
+    VERIFICATION("Verification"),
+}
+
 @Entity(tableName = "categories")
 data class CategoryEntity(
     @PrimaryKey val id: String,
@@ -116,6 +124,10 @@ data class FirmwareEntity(
     val downloadState: String,
     val downloadProgress: Int,
     val updatedAt: Long,
+    val vendor: String = "",
+    val sourceType: String = "community",
+    val releaseDate: String = "",
+    val sourceUrl: String = "",
 )
 
 @Entity(

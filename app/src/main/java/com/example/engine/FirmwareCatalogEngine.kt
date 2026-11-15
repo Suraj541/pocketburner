@@ -10,6 +10,7 @@ import com.example.data.local.RepoParserType
 import com.example.data.local.RepoSourceDao
 import com.example.data.local.RepoSourceEntity
 import com.example.data.local.TaxonomyRepository
+import com.example.data.remote.FirmwareCatalogApiService
 import com.example.hardware.DeviceFamily
 import com.example.hardware.FirmwareCategory
 import com.example.hardware.HardwareRegistry
@@ -29,6 +30,8 @@ class FirmwareCatalogEngine(
     private val firmwareDao: FirmwareDao,
     private val repoDao: RepoSourceDao,
     private val taxonomyRepository: TaxonomyRepository,
+    customApiService: FirmwareCatalogApiService? = null,
+    private val integrityService: FirmwareIntegrityService = FirmwareIntegrityService(),
 ) {
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -36,13 +39,16 @@ class FirmwareCatalogEngine(
         .followRedirects(true)
         .build()
 
+    private val apiService: FirmwareCatalogApiService =
+        customApiService ?: FirmwareCatalogApiService.create(httpClient)
+
     private val firmwareDir: File
         get() = File(context.filesDir, "firmware").apply { mkdirs() }
 
     val defaultRepositories: List<RepoSourceEntity> = listOf(
         RepoSourceEntity(
             id = "repo_m5burner",
-            name = "M5Burner Public Feed",
+            name = "M5Burner HK CDN Feed",
             url = M5BURNER_API_URL,
             parserType = RepoParserType.M5BURNER.name,
             enabled = true,
@@ -52,8 +58,8 @@ class FirmwareCatalogEngine(
         ),
         RepoSourceEntity(
             id = "repo_rpi_imager",
-            name = "Raspberry Pi OS Official Imager Feed",
-            url = "https://downloads.raspberrypi.org/os_list_imagingutility_v4.json",
+            name = "Raspberry Pi Imager Repository",
+            url = RPI_IMAGER_URL,
             parserType = RepoParserType.RPI_IMAGER.name,
             enabled = true,
             lastSyncedAt = 0L,
@@ -61,20 +67,20 @@ class FirmwareCatalogEngine(
             itemCount = 0,
         ),
         RepoSourceEntity(
-            id = "repo_tasmota_esp",
-            name = "Tasmota ESP8266/ESP32/S2/S3/C3/C6 Releases",
-            url = "https://api.github.com/repos/arendst/Tasmota/releases/latest",
-            parserType = RepoParserType.GITHUB_RELEASE.name,
+            id = "repo_espressif_esp32",
+            name = "Espressif ESP32 Arduino Core",
+            url = "https://espressif.github.io/arduino-esp32/package_esp32_index.json",
+            parserType = RepoParserType.ARDUINO_INDEX.name,
             enabled = true,
             lastSyncedAt = 0L,
             lastError = null,
             itemCount = 0,
         ),
         RepoSourceEntity(
-            id = "repo_micropython_esp_rp",
-            name = "MicroPython (ESP32 / ESP8266 / RP2040 / Arduino)",
-            url = "https://api.github.com/repos/micropython/micropython/releases/latest",
-            parserType = RepoParserType.GITHUB_RELEASE.name,
+            id = "repo_esp8266_core",
+            name = "ESP8266 Community Arduino Core",
+            url = "https://arduino.esp8266.com/stable/package_esp8266com_index.json",
+            parserType = RepoParserType.ARDUINO_INDEX.name,
             enabled = true,
             lastSyncedAt = 0L,
             lastError = null,
@@ -85,6 +91,76 @@ class FirmwareCatalogEngine(
             name = "Arduino Official Package Index",
             url = "https://downloads.arduino.cc/packages/package_index.json",
             parserType = RepoParserType.ARDUINO_INDEX.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_adafruit_index",
+            name = "Adafruit Board Index",
+            url = "https://adafruit.github.io/arduino-board-index/package_adafruit_index.json",
+            parserType = RepoParserType.ARDUINO_INDEX.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_espidf_releases",
+            name = "Espressif ESP-IDF Releases",
+            url = "https://api.github.com/repos/espressif/esp-idf/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_wled_esp",
+            name = "WLED Firmware Releases",
+            url = "https://api.github.com/repos/wled/WLED/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_tasmota_esp",
+            name = "Tasmota Smart Home Releases",
+            url = "https://api.github.com/repos/arendst/Tasmota/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_esphome_releases",
+            name = "ESPHome Releases",
+            url = "https://api.github.com/repos/esphome/esphome/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_micropython_esp_rp",
+            name = "MicroPython Releases",
+            url = "https://api.github.com/repos/micropython/micropython/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
+            enabled = true,
+            lastSyncedAt = 0L,
+            lastError = null,
+            itemCount = 0,
+        ),
+        RepoSourceEntity(
+            id = "repo_meshtastic_esp",
+            name = "Meshtastic LoRa Releases",
+            url = "https://api.github.com/repos/meshtastic/firmware/releases/latest",
+            parserType = RepoParserType.GITHUB_RELEASE.name,
             enabled = true,
             lastSyncedAt = 0L,
             lastError = null,
@@ -119,13 +195,23 @@ class FirmwareCatalogEngine(
             val current = existingById[defaultRepo.id]
             if (current == null) {
                 toUpsert.add(defaultRepo)
-            } else if (defaultRepo.id == "repo_m5burner" && current.url != M5BURNER_API_URL) {
-                toUpsert.add(current.copy(url = M5BURNER_API_URL, lastError = null))
+            } else if (
+                (defaultRepo.id == "repo_m5burner" && current.url != M5BURNER_API_URL) ||
+                (defaultRepo.id == "repo_rpi_imager" && current.url != RPI_IMAGER_URL)
+            ) {
+                toUpsert.add(current.copy(url = defaultRepo.url, lastError = null))
             }
         }
         if (toUpsert.isNotEmpty()) {
             repoDao.upsertAll(toUpsert)
         }
+    }
+
+    suspend fun fetchAndSaveM5BurnerCatalogViaRetrofit(): Result<Int> = withContext(Dispatchers.IO) {
+        ensureDefaultReposSeeded()
+        val m5Repo = repoDao.getAll().firstOrNull { it.id == "repo_m5burner" }
+            ?: defaultRepositories.first { it.id == "repo_m5burner" }
+        syncSingleRepo(m5Repo)
     }
 
     suspend fun syncAllEnabledRepos(): List<String> = withContext(Dispatchers.IO) {
@@ -143,25 +229,23 @@ class FirmwareCatalogEngine(
 
     suspend fun syncSingleRepo(repo: RepoSourceEntity): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            val request = Request.Builder()
-                .url(repo.url)
-                .header("Accept", "application/json")
-                .header("User-Agent", "PocketBurner-Android/1.0")
-                .build()
-
-            val bodyText = httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    throw IllegalStateException("HTTP ${response.code} ${response.message}")
-                }
-                response.body?.string() ?: throw IllegalStateException("Empty response body")
+            val response = if (repo.id == "repo_m5burner" && repo.url.equals(M5BURNER_API_URL, ignoreCase = true)) {
+                apiService.fetchM5BurnerCatalogRaw()
+            } else {
+                apiService.fetchFeedRaw(repo.url)
             }
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code()} ${response.message()}")
+            }
+            val bodyText = response.body()?.use { it.string() }
+                ?: throw IllegalStateException("Empty response body")
 
             val parsed = when (RepoParserType.valueOf(repo.parserType)) {
-                RepoParserType.M5BURNER -> parseM5BurnerFeed(bodyText, repo.id)
-                RepoParserType.RPI_IMAGER -> parseRpiImagerFeed(bodyText, repo.id)
-                RepoParserType.GITHUB_RELEASE -> parseGitHubReleaseFeed(bodyText, repo.id, repo.name)
-                RepoParserType.ARDUINO_INDEX -> parseArduinoIndexFeed(bodyText, repo.id)
-                RepoParserType.CUSTOM_JSON -> parseCustomFeed(bodyText, repo.id)
+                RepoParserType.M5BURNER -> parseM5BurnerFeed(bodyText, repo.id, repo.url)
+                RepoParserType.RPI_IMAGER -> parseRpiImagerFeed(bodyText, repo.id, repo.url)
+                RepoParserType.GITHUB_RELEASE -> parseGitHubReleaseFeed(bodyText, repo.id, repo.name, repo.url)
+                RepoParserType.ARDUINO_INDEX -> parseArduinoIndexFeed(bodyText, repo.id, repo.url)
+                RepoParserType.CUSTOM_JSON -> parseCustomFeed(bodyText, repo.id, repo.url)
             }
 
             // Preserve already-downloaded state if item ID matches
@@ -474,16 +558,21 @@ class FirmwareCatalogEngine(
                 }
             }
 
-            val computedSha = digest.digest().joinToString("") { "%02x".format(it) }
-            if (!item.sha256.isNullOrBlank() && !item.sha256.equals(computedSha, ignoreCase = true)) {
+            val normalizedExpected = FirmwareIntegrityService.normalizeSha256(item.sha256)
+            val verifyRes = integrityService.verifyBeforeFlash(
+                file = destFile,
+                expectedSha256 = normalizedExpected,
+                requireExpectedHash = false,
+            )
+            val report = verifyRes.getOrElse { err ->
                 destFile.delete()
-                throw IllegalStateException("SHA-256 mismatch! Expected ${item.sha256.take(12)}…, got ${computedSha.take(12)}…")
+                throw IllegalStateException(err.message ?: "SHA-256 verification failed", err)
             }
 
             val updated = item.copy(
                 localFilePath = destFile.absolutePath,
                 sizeBytes = downloaded,
-                sha256 = item.sha256 ?: computedSha,
+                sha256 = normalizedExpected ?: report.actualSha256,
                 downloadState = DownloadState.DOWNLOADED.name,
                 downloadProgress = 100,
                 updatedAt = System.currentTimeMillis(),
@@ -505,7 +594,11 @@ class FirmwareCatalogEngine(
         }
     }
 
-    internal fun parseM5BurnerFeed(json: String, repoId: String): List<FirmwareEntity> {
+    internal fun parseM5BurnerFeed(
+        json: String,
+        repoId: String,
+        sourceUrl: String = M5BURNER_API_URL,
+    ): List<FirmwareEntity> {
         val array = when {
             json.trim().startsWith("[") -> JSONArray(json)
             else -> {
@@ -528,6 +621,10 @@ class FirmwareCatalogEngine(
             val author = obj.optString("author")
                 .ifBlank { obj.optString("published_by") }
                 .ifBlank { obj.optString("publisher", "M5Stack Community") }
+            val isOfficialM5 = (obj.optBoolean("official", false) ||
+                author.equals("M5Stack", ignoreCase = true) ||
+                author.equals("M5Stack Official", ignoreCase = true)) &&
+                !repoId.contains("bmorcelli")
 
             val rawCategory = obj.optJSONArray("category")?.optString(0).orEmpty()
                 .ifBlank { obj.optString("category").takeIf { !it.startsWith("[") }.orEmpty() }
@@ -638,6 +735,12 @@ class FirmwareCatalogEngine(
                 baseDesc
             }
 
+            val releaseDate = obj.optString("updated_at")
+                .ifBlank { obj.optString("created_at") }
+                .ifBlank { obj.optString("release_date") }
+                .take(10)
+            val entrySourceUrl = obj.optString("repository").ifBlank { sourceUrl }
+
             val firstBoard = HardwareRegistry.findById(deviceCsv.substringBefore(",").trim())
             items.add(
                 FirmwareEntity(
@@ -656,7 +759,7 @@ class FirmwareCatalogEngine(
                     localFilePath = null,
                     fileExtension = downloadUrl.substringBefore("?").substringAfterLast(".", "bin"),
                     sizeBytes = obj.optLong("size", 0L),
-                    sha256 = obj.optString("sha256").takeIf { it.isNotBlank() },
+                    sha256 = obj.optString("sha256").ifBlank { obj.optString("checksum") }.takeIf { it.isNotBlank() },
                     flashOffset = obj.optString("offset").ifBlank { firstFileOffset }.ifBlank { firstBoard?.appOffset ?: "0x0000" },
                     defaultBaud = obj.optInt("default_baud", firstBoard?.defaultBaud ?: 921600),
                     flashMode = obj.optString("flash_mode").ifBlank { firstBoard?.flashMode ?: "DIO" },
@@ -665,6 +768,10 @@ class FirmwareCatalogEngine(
                     downloadState = DownloadState.NOT_DOWNLOADED.name,
                     downloadProgress = 0,
                     updatedAt = System.currentTimeMillis(),
+                    vendor = author,
+                    sourceType = if (isOfficialM5) "official" else "community",
+                    releaseDate = releaseDate,
+                    sourceUrl = entrySourceUrl,
                 )
             )
         }
@@ -696,10 +803,35 @@ class FirmwareCatalogEngine(
         return inferDevicesFromAssetName(lower).firstOrNull() ?: trimmed
     }
 
-    private fun parseRpiImagerFeed(json: String, repoId: String): List<FirmwareEntity> {
+    internal fun parseRpiImagerFeed(
+        json: String,
+        repoId: String,
+        sourceUrl: String = RPI_IMAGER_URL,
+    ): List<FirmwareEntity> {
         val root = JSONObject(json)
         val osList = root.optJSONArray("os_list") ?: return emptyList()
         val result = mutableListOf<FirmwareEntity>()
+
+        fun inferOsProvider(name: String, parentCategory: String, url: String): Pair<String, Boolean> {
+            val combined = "$name $parentCategory $url".lowercase()
+            return when {
+                combined.contains("ubuntu") -> "Canonical / Ubuntu" to false
+                combined.contains("dietpi") -> "DietPi Project" to false
+                combined.contains("kali") -> "Kali Linux (OffSec)" to false
+                combined.contains("libreelec") -> "LibreELEC Project" to false
+                combined.contains("volumio") -> "Volumio" to false
+                combined.contains("manjaro") -> "Manjaro ARM" to false
+                combined.contains("retropie") -> "RetroPie Project" to false
+                combined.contains("recalbox") -> "Recalbox" to false
+                combined.contains("batocera") -> "Batocera" to false
+                combined.contains("home assistant") -> "Home Assistant" to false
+                combined.contains("octopi") -> "OctoPrint / OctoPi" to false
+                combined.contains("lineage") -> "LineageOS Community" to false
+                combined.contains("raspberry pi os") || url.contains("downloads.raspberrypi.", ignoreCase = true) ->
+                    "Raspberry Pi Ltd" to true
+                else -> "${parentCategory.ifBlank { "Third-Party OS Provider" }}" to false
+            }
+        }
 
         fun walk(arr: JSONArray, parentCategory: String) {
             for (i in 0 until arr.length()) {
@@ -720,7 +852,7 @@ class FirmwareCatalogEngine(
                             when {
                                 raw.contains("pi5") -> add("Raspberry Pi 5")
                                 raw.contains("pi4") -> add("Raspberry Pi 4B")
-                                raw.contains("pi3") -> add("Raspberry Pi Zero 2 W")
+                                raw.contains("pi3") || raw.contains("zero") -> add("Raspberry Pi Zero 2 W")
                             }
                         }
                     }
@@ -731,26 +863,30 @@ class FirmwareCatalogEngine(
                     }
                 }.distinct().joinToString(",")
 
-                val version = obj.optString("release_date").ifBlank { "Latest" }
+                val (vendorName, isOfficialRpi) = inferOsProvider(name, parentCategory, url)
+                val releaseDate = obj.optString("release_date").ifBlank { "Latest" }
                 val ext = url.substringBefore("?").substringAfterLast(".", "img.xz")
+                val sha = obj.optString("extract_sha256")
+                    .ifBlank { obj.optString("image_download_sha256") }
+                    .takeIf { it.isNotBlank() }
                 result.add(
                     FirmwareEntity(
                         id = "${repoId}_${name.hashCode()}_${result.size}",
                         title = name,
-                        author = "Raspberry Pi Foundation",
+                        author = vendorName,
                         category = FirmwareCategory.TOOLS.label,
                         deviceTagsCsv = devTags,
                         family = DeviceFamily.RASPBERRY_PI.name,
-                        version = version,
-                        availableVersionsCsv = version,
-                        framework = "Raspberry Pi OS ($parentCategory)",
-                        description = obj.optString("description").ifBlank { "Official Raspberry Pi OS disk image." },
+                        version = releaseDate,
+                        availableVersionsCsv = releaseDate,
+                        framework = if (isOfficialRpi) "Raspberry Pi OS ($parentCategory)" else "$vendorName ($parentCategory)",
+                        description = obj.optString("description").ifBlank { "$vendorName ARM operating system image." },
                         coverImageUrl = obj.optString("icon").takeIf { it.isNotBlank() },
                         downloadUrl = url,
                         localFilePath = null,
                         fileExtension = ext,
                         sizeBytes = obj.optLong("image_download_size", 0L),
-                        sha256 = obj.optString("extract_sha256").takeIf { it.isNotBlank() },
+                        sha256 = sha,
                         flashOffset = "0x0000",
                         defaultBaud = 115200,
                         flashMode = "Raw Block (.img/.xz)",
@@ -759,20 +895,41 @@ class FirmwareCatalogEngine(
                         downloadState = DownloadState.NOT_DOWNLOADED.name,
                         downloadProgress = 0,
                         updatedAt = System.currentTimeMillis(),
+                        vendor = vendorName,
+                        sourceType = if (isOfficialRpi) "official" else "community",
+                        releaseDate = releaseDate,
+                        sourceUrl = obj.optString("website").ifBlank { sourceUrl },
                     )
                 )
-                if (result.size >= 30) return
             }
         }
         walk(osList, "OS")
         return result
     }
 
-    internal fun parseGitHubReleaseFeed(json: String, repoId: String, repoName: String): List<FirmwareEntity> {
+    internal fun parseGitHubReleaseFeed(
+        json: String,
+        repoId: String,
+        repoName: String,
+        sourceUrl: String = "",
+    ): List<FirmwareEntity> {
         val root = JSONObject(json)
         val tag = root.optString("tag_name", "latest")
+        val releaseDate = root.optString("published_at").take(10)
+        val releaseHtmlUrl = root.optString("html_url").ifBlank { sourceUrl }
         val body = root.optString("body", "").lineSequence().take(3).joinToString(" ").take(220)
         val author = root.optJSONObject("author")?.optString("login") ?: "GitHub Release"
+        val isOfficialRepo = repoId == "repo_espidf_releases"
+        val vendorName = when (repoId) {
+            "repo_espidf_releases" -> "Espressif Systems"
+            "repo_wled_esp" -> "WLED Project"
+            "repo_tasmota_esp" -> "Tasmota"
+            "repo_esphome_releases" -> "ESPHome"
+            "repo_micropython_esp_rp" -> "MicroPython"
+            "repo_meshtastic_esp" -> "Meshtastic"
+            "repo_bmorcelli_launcher" -> "bmorcelli (M5Launcher)"
+            else -> author
+        }
         val assets = root.optJSONArray("assets") ?: return emptyList()
         val result = mutableListOf<FirmwareEntity>()
 
@@ -790,16 +947,18 @@ class FirmwareCatalogEngine(
             val firstBoard = HardwareRegistry.findById(inferredDevices.firstOrNull() ?: "ESP32 DevKit")
             val category = when {
                 lower.contains("launcher") || repoId.contains("bmorcelli") -> FirmwareCategory.UI_LAUNCHER.label
-                lower.contains("tasmota") -> FirmwareCategory.IOT_AUTOMATION.label
+                lower.contains("tasmota") || lower.contains("wled") || lower.contains("esphome") -> FirmwareCategory.IOT_AUTOMATION.label
+                lower.contains("meshtastic") -> FirmwareCategory.NETWORK_COMMUNICATION.label
                 lower.contains("micropython") -> FirmwareCategory.DEVELOPMENT_LEARNING.label
                 else -> FirmwareCategory.TOOLS.label
             }
+            val shaDigest = asset.optString("digest").removePrefix("sha256:").takeIf { it.isNotBlank() }
 
             result.add(
                 FirmwareEntity(
                     id = "${repoId}_${name.hashCode()}",
                     title = name.substringBeforeLast("."),
-                    author = author,
+                    author = vendorName,
                     category = category,
                     deviceTagsCsv = inferredDevices.joinToString(","),
                     family = (firstBoard?.family ?: DeviceFamily.ESP_IOT).name,
@@ -812,7 +971,7 @@ class FirmwareCatalogEngine(
                     localFilePath = null,
                     fileExtension = lower.substringAfterLast("."),
                     sizeBytes = asset.optLong("size", 0L),
-                    sha256 = null,
+                    sha256 = shaDigest,
                     flashOffset = firstBoard?.appOffset ?: "0x0000",
                     defaultBaud = firstBoard?.defaultBaud ?: 921600,
                     flashMode = firstBoard?.flashMode ?: "DIO",
@@ -821,23 +980,32 @@ class FirmwareCatalogEngine(
                     downloadState = DownloadState.NOT_DOWNLOADED.name,
                     downloadProgress = 0,
                     updatedAt = System.currentTimeMillis(),
+                    vendor = vendorName,
+                    sourceType = if (isOfficialRepo) "official" else "community",
+                    releaseDate = releaseDate,
+                    sourceUrl = releaseHtmlUrl,
                 )
             )
         }
         return result
     }
 
-    private fun parseArduinoIndexFeed(json: String, repoId: String): List<FirmwareEntity> {
+    internal fun parseArduinoIndexFeed(
+        json: String,
+        repoId: String,
+        sourceUrl: String = "",
+    ): List<FirmwareEntity> {
         val root = JSONObject(json)
         val packages = root.optJSONArray("packages") ?: return emptyList()
         val result = mutableListOf<FirmwareEntity>()
+        val isOfficialCore = repoId == "repo_arduino_index" || repoId == "repo_espressif_esp32"
 
         for (p in 0 until packages.length()) {
             val pkg = packages.optJSONObject(p) ?: continue
             val maintainer = pkg.optString("maintainer", "Arduino")
+            val pkgSiteUrl = pkg.optString("websiteURL").ifBlank { sourceUrl }
             val platforms = pkg.optJSONArray("platforms") ?: continue
             val seenArch = mutableSetOf<String>()
-            // Walk newest platforms first
             for (i in platforms.length() - 1 downTo 0) {
                 val plat = platforms.optJSONObject(i) ?: continue
                 val arch = plat.optString("architecture")
@@ -858,10 +1026,16 @@ class FirmwareCatalogEngine(
                 val mappedDevice = when {
                     arch.contains("renesas", true) -> "Arduino Uno R4 WiFi"
                     arch.contains("mega", true) || arch.contains("avr", true) -> "Arduino Uno R3,Arduino Mega 2560,Arduino Nano"
-                    arch.contains("esp32", true) -> "Arduino Nano ESP32"
-                    arch.contains("rp2040", true) -> "Raspberry Pi Pico"
+                    arch.contains("esp32", true) -> "ESP32 DevKit,ESP32-S3,ESP32-C6,Arduino Nano ESP32"
+                    arch.contains("esp8266", true) -> "ESP8266"
+                    arch.contains("rp2040", true) -> "Raspberry Pi Pico,Raspberry Pi Pico 2"
                     arch.contains("sam", true) -> "Arduino Due"
                     else -> "Arduino Uno R3"
+                }
+                val familyName = when {
+                    arch.contains("esp", true) -> DeviceFamily.ESP_IOT.name
+                    arch.contains("rp2040", true) -> DeviceFamily.RASPBERRY_PI.name
+                    else -> DeviceFamily.ARDUINO.name
                 }
 
                 result.add(
@@ -871,25 +1045,29 @@ class FirmwareCatalogEngine(
                         author = maintainer,
                         category = FirmwareCategory.DEVELOPMENT_LEARNING.label,
                         deviceTagsCsv = mappedDevice,
-                        family = DeviceFamily.ARDUINO.name,
+                        family = familyName,
                         version = version,
                         availableVersionsCsv = version,
-                        framework = "Arduino Core ($arch)",
-                        description = "Official Arduino core archive supporting: ${boardNames.joinToString(", ").ifBlank { arch }}.",
+                        framework = "Board Package ($arch)",
+                        description = "${if (isOfficialCore) "Official" else "Third-party"} board core supporting: ${boardNames.joinToString(", ").ifBlank { arch }}.",
                         coverImageUrl = null,
                         downloadUrl = url,
                         localFilePath = null,
                         fileExtension = url.substringAfterLast(".", "tar.bz2"),
                         sizeBytes = plat.optString("size").toLongOrNull() ?: 0L,
-                        sha256 = plat.optString("checksum").removePrefix("SHA-256:").takeIf { it.isNotBlank() },
+                        sha256 = FirmwareIntegrityService.normalizeSha256(plat.optString("checksum")),
                         flashOffset = "0x0000",
                         defaultBaud = 115200,
-                        flashMode = "STK500 / BOSSA",
+                        flashMode = if (arch.contains("esp", true)) "DIO" else "STK500 / BOSSA",
                         repoSourceId = repoId,
                         isCustomUserAdded = false,
                         downloadState = DownloadState.NOT_DOWNLOADED.name,
                         downloadProgress = 0,
                         updatedAt = System.currentTimeMillis(),
+                        vendor = maintainer,
+                        sourceType = if (isOfficialCore) "official" else "community",
+                        releaseDate = "",
+                        sourceUrl = pkgSiteUrl,
                     )
                 )
             }
@@ -897,13 +1075,13 @@ class FirmwareCatalogEngine(
         return result
     }
 
-    private fun parseCustomFeed(json: String, repoId: String): List<FirmwareEntity> {
+    private fun parseCustomFeed(json: String, repoId: String, sourceUrl: String): List<FirmwareEntity> {
         val trimmed = json.trim()
         return when {
-            trimmed.contains("\"os_list\"") -> parseRpiImagerFeed(trimmed, repoId)
-            trimmed.contains("\"assets\"") && trimmed.contains("\"tag_name\"") -> parseGitHubReleaseFeed(trimmed, repoId, "Custom GitHub")
-            trimmed.contains("\"packages\"") && trimmed.contains("\"platforms\"") -> parseArduinoIndexFeed(trimmed, repoId)
-            else -> parseM5BurnerFeed(trimmed, repoId)
+            trimmed.contains("\"os_list\"") -> parseRpiImagerFeed(trimmed, repoId, sourceUrl)
+            trimmed.contains("\"assets\"") && trimmed.contains("\"tag_name\"") -> parseGitHubReleaseFeed(trimmed, repoId, "Custom GitHub", sourceUrl)
+            trimmed.contains("\"packages\"") && trimmed.contains("\"platforms\"") -> parseArduinoIndexFeed(trimmed, repoId, sourceUrl)
+            else -> parseM5BurnerFeed(trimmed, repoId, sourceUrl)
         }
     }
 
@@ -976,5 +1154,6 @@ class FirmwareCatalogEngine(
 
     companion object {
         const val M5BURNER_API_URL = "http://m5burner-api-fc-hk-cdn.m5stack.com/api/firmware"
+        const val RPI_IMAGER_URL = "https://downloads.raspberrypi.com/os_list_imagingutility_v4.json"
     }
 }

@@ -257,6 +257,7 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
                     flashOffsetHex = flashOffsetHex,
                     flashMode = board.flashMode,
                     eraseBeforeFlash = eraseBeforeFlash,
+                    expectedSha256 = firmware.sha256,
                 ),
             )
         } else {
@@ -271,6 +272,7 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
                     offsetHex = flashOffsetHex,
                     flashMode = board.flashMode,
                     eraseBefore = eraseBeforeFlash,
+                    expectedSha256 = firmware.sha256,
                 ),
             )
         }
@@ -407,9 +409,12 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
             return
         }
         val file = File(path)
+        val verifiedConfig = config.copy(
+            expectedSha256 = config.expectedSha256 ?: firmware.sha256,
+        )
         val svc = boundWifiOtaService
         if (svc != null) {
-            svc.startOtaPush(file, firmware.title, config)
+            svc.startOtaPush(file, firmware.title, verifiedConfig)
         } else {
             WifiOtaFlashingService.startServiceAction(
                 appContext,
@@ -417,7 +422,7 @@ class ConnectViewModel(private val container: AppContainer) : ViewModel() {
                     context = appContext,
                     firmwarePath = file.absolutePath,
                     firmwareTitle = firmware.title,
-                    config = config,
+                    config = verifiedConfig,
                 ),
             )
         }
