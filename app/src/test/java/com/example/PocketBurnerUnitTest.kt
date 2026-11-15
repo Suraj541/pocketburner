@@ -796,4 +796,84 @@ class PocketBurnerUnitTest {
             tempBin.delete()
         }
     }
+
+    @Test
+    fun scriptSyntaxEngine_highlightsAndDetectsErrorsAcrossCppMicroPythonAndLua() {
+        // 1. All built-in starter templates must pass with zero syntax errors
+        ScriptLanguage.entries.forEach { lang ->
+            val clean = com.example.engine.ScriptSyntaxEngine.analyze(lang.starterTemplate, lang)
+            assertEquals(
+                "Starter template for ${lang.displayName} should have 0 errors, got: ${clean.diagnostics}",
+                0,
+                clean.errorCount,
+            )
+            assertTrue(clean.tokens.isNotEmpty())
+        }
+
+        // 2. Arduino C++ tokenization + missing semicolon / unclosed brace / conditional assignment diagnostics
+        val badCpp = """
+            #include <Arduino.h>
+            /* Multi-line
+               void inside comment should not trigger */
+            void setup() {
+              uint8_t pin = 2
+              if (pin = 1) {
+                Serial.println("if while inside string");
+              }
+        """.trimIndent()
+        val cppResult = com.example.engine.ScriptSyntaxEngine.analyze(badCpp, ScriptLanguage.ARDUINO_CPP)
+        assertTrue(cppResult.tokens.any { it.type == com.example.engine.SyntaxTokenType.PREPROCESSOR })
+        assertTrue(cppResult.tokens.any { it.type == com.example.engine.SyntaxTokenType.COMMENT })
+        assertTrue(cppResult.tokens.any { it.type == com.example.engine.SyntaxTokenType.TYPE_OR_HARDWARE })
+        assertTrue(cppResult.diagnostics.any { it.lineIndex == 4 && it.severity == com.example.engine.DiagnosticSeverity.ERROR && it.message.contains(";") })
+        assertTrue(cppResult.diagnostics.any { it.lineIndex == 5 && it.severity == com.example.engine.DiagnosticSeverity.WARNING })
+        assertTrue(cppResult.diagnostics.any { it.lineIndex == 3 && it.message.contains("Unclosed '{'") })
+        // Ensure 'void' inside block comment (line 2) was not tokenized as keyword
+        val commentTok = cppResult.tokens.first { it.type == com.example.engine.SyntaxTokenType.COMMENT }
+        assertFalse(
+            cppResult.tokens.any {
+                it.type == com.example.engine.SyntaxTokenType.KEYWORD &&
+                    it.start >= commentTok.start && it.endExclusive <= commentTok.endExclusive
+            }
+        )
+
+        // 3. MicroPython missing ':' & unterminated string & assignment in if
+        val badPy = """
+            from machine import Pin
+            def blink(pin)
+                msg = "unclosed
+                if pin = 1:
+                    pin.on()
+        """.trimIndent()
+        val pyResult = com.example.engine.ScriptSyntaxEngine.analyze(badPy, ScriptLanguage.MICROPYTHON)
+        assertTrue(pyResult.diagnostics.any { it.lineIndex == 1 && it.message.contains("':'") })
+        assertTrue(pyResult.diagnostics.any { it.lineIndex == 2 && it.message.contains("Unterminated string") })
+        assertTrue(pyResult.diagnostics.any { it.lineIndex == 3 && it.message.contains("'=='") })
+
+        // 4. Lua block comment, missing 'then', and unmatched 'end'
+        val badLua = """
+            --[[ block comment
+                 with function keyword ignored ]]
+            local pin = 4
+            if pin == 4
+              gpio.write(pin, gpio.HIGH)
+            end
+            end
+        """.trimIndent()
+        val luaResult = com.example.engine.ScriptSyntaxEngine.analyze(badLua, ScriptLanguage.LUA)
+        assertTrue(luaResult.tokens.any { it.type == com.example.engine.SyntaxTokenType.COMMENT })
+        assertTrue(luaResult.tokens.any { it.type == com.example.engine.SyntaxTokenType.TYPE_OR_HARDWARE })
+        assertTrue(luaResult.diagnostics.any { it.lineIndex == 3 && it.message.contains("'then'") })
+        assertTrue(luaResult.diagnostics.any { it.lineIndex == 6 && it.message.contains("Unexpected Lua 'end'") })
+
+        // 5. AnnotatedString highlighter preserves exact text length + applies span styles
+        val highlighted = com.example.engine.ScriptSyntaxEngine.buildHighlightedText(
+            source = badCpp,
+            language = ScriptLanguage.ARDUINO_CPP,
+            searchQuery = "pin",
+            analysis = cppResult,
+        )
+        assertEquals(badCpp, highlighted.text)
+        assertTrue(highlighted.spanStyles.isNotEmpty())
+    }
 }

@@ -9,7 +9,9 @@ import com.example.data.local.ScriptEntity
 import com.example.data.local.SecurityAndTransportSettings
 import com.example.engine.ActiveConnection
 import com.example.engine.ScriptLanguage
+import com.example.engine.ScriptSyntaxEngine
 import com.example.engine.ScriptTransferMode
+import com.example.engine.SyntaxAnalysisResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -28,6 +30,10 @@ data class NanoEditorUiState(
     val statusBarMessage: String = "[ New Buffer ]",
     val isTransferring: Boolean = false,
     val transferProgress: Float = 0f,
+    val syntaxAnalysis: SyntaxAnalysisResult = ScriptSyntaxEngine.analyze(
+        ScriptLanguage.MICROPYTHON.starterTemplate,
+        ScriptLanguage.MICROPYTHON,
+    ),
 )
 
 class NanoViewModel(private val container: AppContainer) : ViewModel() {
@@ -51,14 +57,16 @@ class NanoViewModel(private val container: AppContainer) : ViewModel() {
             val (existing, content) = scriptRepo.loadScriptContent(fileName)
             val lang = existing?.let { runCatching { ScriptLanguage.valueOf(it.language) }.getOrNull() }
                 ?: ScriptLanguage.detectFromFileName(fileName)
-            _uiState.value = _uiState.value.copy(
-                currentScriptId = existing?.id,
-                fileName = existing?.fileName ?: fileName,
-                language = lang,
-                code = content,
-                targetDeviceId = existing?.targetDeviceId ?: settings.value.selectedBoardId,
-                isModified = existing == null,
-                statusBarMessage = if (existing != null) "[ Loaded ${existing.fileName} ]" else "[ New File $fileName ]",
+            updateBufferState(
+                _uiState.value.copy(
+                    currentScriptId = existing?.id,
+                    fileName = existing?.fileName ?: fileName,
+                    language = lang,
+                    code = content,
+                    targetDeviceId = existing?.targetDeviceId ?: settings.value.selectedBoardId,
+                    isModified = existing == null,
+                    statusBarMessage = if (existing != null) "[ Loaded ${existing.fileName} ]" else "[ New File $fileName ]",
+                )
             )
         }
     }
@@ -69,53 +77,63 @@ class NanoViewModel(private val container: AppContainer) : ViewModel() {
 
     fun loadGeneratedScript(fileName: String, code: String, targetDeviceId: String) {
         val detected = ScriptLanguage.detectFromFileName(fileName)
-        _uiState.value = _uiState.value.copy(
-            currentScriptId = null,
-            fileName = fileName,
-            language = detected,
-            code = code,
-            targetDeviceId = targetDeviceId,
-            isModified = true,
-            statusBarMessage = "[ Loaded AI-synthesized $fileName for $targetDeviceId ]",
+        updateBufferState(
+            _uiState.value.copy(
+                currentScriptId = null,
+                fileName = fileName,
+                language = detected,
+                code = code,
+                targetDeviceId = targetDeviceId,
+                isModified = true,
+                statusBarMessage = "[ Loaded AI-synthesized $fileName for $targetDeviceId ]",
+            )
         )
     }
 
     fun updateCode(newCode: String) {
-        _uiState.value = _uiState.value.copy(
-            code = newCode,
-            isModified = true,
-            statusBarMessage = "[ Modified ]",
+        updateBufferState(
+            _uiState.value.copy(
+                code = newCode,
+                isModified = true,
+                statusBarMessage = "[ Modified ]",
+            )
         )
     }
 
     fun updateFileName(name: String) {
         val detected = ScriptLanguage.detectFromFileName(name)
-        _uiState.value = _uiState.value.copy(
-            fileName = name,
-            language = detected,
-            isModified = true,
+        updateBufferState(
+            _uiState.value.copy(
+                fileName = name,
+                language = detected,
+                isModified = true,
+            )
         )
     }
 
     fun selectLanguage(lang: ScriptLanguage) {
         val current = _uiState.value
         val stem = current.fileName.substringBeforeLast(".").ifBlank { "script" }
-        _uiState.value = current.copy(
-            language = lang,
-            fileName = "$stem.${lang.extension}",
-            isModified = true,
-            statusBarMessage = "[ Language: ${lang.displayName} ]",
+        updateBufferState(
+            current.copy(
+                language = lang,
+                fileName = "$stem.${lang.extension}",
+                isModified = true,
+                statusBarMessage = "[ Language: ${lang.displayName} ]",
+            )
         )
     }
 
     fun loadStarterTemplate(lang: ScriptLanguage) {
-        _uiState.value = _uiState.value.copy(
-            currentScriptId = null,
-            fileName = "main.${lang.extension}",
-            language = lang,
-            code = lang.starterTemplate,
-            isModified = true,
-            statusBarMessage = "[ Loaded ${lang.displayName} template ]",
+        updateBufferState(
+            _uiState.value.copy(
+                currentScriptId = null,
+                fileName = "main.${lang.extension}",
+                language = lang,
+                code = lang.starterTemplate,
+                isModified = true,
+                statusBarMessage = "[ Loaded ${lang.displayName} template ]",
+            )
         )
     }
 
@@ -126,10 +144,12 @@ class NanoViewModel(private val container: AppContainer) : ViewModel() {
     fun insertSnippet(snippet: String) {
         val cur = _uiState.value.code
         val next = if (cur.endsWith("\n") || cur.isEmpty()) "$cur$snippet\n" else "$cur\n$snippet\n"
-        _uiState.value = _uiState.value.copy(
-            code = next,
-            isModified = true,
-            statusBarMessage = "[ Inserted helper snippet ]",
+        updateBufferState(
+            _uiState.value.copy(
+                code = next,
+                isModified = true,
+                statusBarMessage = "[ Inserted helper snippet ]",
+            )
         )
     }
 
@@ -137,11 +157,13 @@ class NanoViewModel(private val container: AppContainer) : ViewModel() {
         val lines = _uiState.value.code.lines().toMutableList()
         if (lineIndex in lines.indices) {
             val removed = lines.removeAt(lineIndex)
-            _uiState.value = _uiState.value.copy(
-                code = lines.joinToString("\n"),
-                cutBuffer = removed,
-                isModified = true,
-                statusBarMessage = "[ ^K Cut line ${lineIndex + 1} ]",
+            updateBufferState(
+                _uiState.value.copy(
+                    code = lines.joinToString("\n"),
+                    cutBuffer = removed,
+                    isModified = true,
+                    statusBarMessage = "[ ^K Cut line ${lineIndex + 1} ]",
+                )
             )
         }
     }
@@ -155,11 +177,23 @@ class NanoViewModel(private val container: AppContainer) : ViewModel() {
         val lines = _uiState.value.code.lines().toMutableList()
         val insertIdx = (afterLineIndex + 1).coerceIn(0, lines.size)
         lines.add(insertIdx, cut)
-        _uiState.value = _uiState.value.copy(
-            code = lines.joinToString("\n"),
-            isModified = true,
-            statusBarMessage = "[ ^U Pasted line ]",
+        updateBufferState(
+            _uiState.value.copy(
+                code = lines.joinToString("\n"),
+                isModified = true,
+                statusBarMessage = "[ ^U Pasted line ]",
+            )
         )
+    }
+
+    private fun updateBufferState(next: NanoEditorUiState) {
+        val prev = _uiState.value
+        val needsReanalyze = next.code != prev.code || next.language != prev.language
+        _uiState.value = if (needsReanalyze) {
+            next.copy(syntaxAnalysis = ScriptSyntaxEngine.analyze(next.code, next.language))
+        } else {
+            next
+        }
     }
 
     fun saveToLocalStorage() {

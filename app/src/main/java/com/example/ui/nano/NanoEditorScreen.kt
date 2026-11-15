@@ -66,10 +66,22 @@ import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalDensity
 import com.example.data.local.ScriptEntity
 import com.example.engine.ActiveConnection
+import com.example.engine.CodeDiagnostic
+import com.example.engine.DiagnosticSeverity
 import com.example.engine.ScriptLanguage
+import com.example.engine.ScriptSyntaxEngine
 import com.example.engine.ScriptTransferMode
+import com.example.engine.SyntaxAnalysisResult
 import com.example.hardware.HardwareRegistry
 import com.example.ui.components.ConnectionStatusPill
 import com.example.ui.components.EncryptionTogglePill
@@ -92,6 +104,7 @@ fun NanoEditorScreen(
 
     var showHelperPanel by remember { mutableStateOf(false) }
     var showSearchBar by remember { mutableStateOf(false) }
+    var showProblemsPanel by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
     var showVaultDialog by remember { mutableStateOf(false) }
     var showTransferDialog by remember { mutableStateOf(false) }
@@ -108,7 +121,9 @@ fun NanoEditorScreen(
     )
 
     val statusColors = LocalHardwareStatusColors.current
+    val analysis = uiState.syntaxAnalysis
     val lineCount = remember(uiState.code) { uiState.code.lines().size.coerceAtLeast(1) }
+    val gutterLineHeightDp = with(LocalDensity.current) { MonoTextStyles.CodeEditor.lineHeight.toDp() }
 
     Column(modifier = modifier.fillMaxSize()) {
         // GNU Nano-Inspired Top Header Bar
@@ -227,11 +242,11 @@ fun NanoEditorScreen(
             }
         }
 
-        // Code Editor Viewport with Line Numbers & Syntax Highlighting
+        // Code Editor Viewport with Line Numbers, Error Gutter Markers & Multi-Language Highlighting
         val scrollState = rememberScrollState()
         val horizontalScroll = rememberScrollState()
-        val syntaxTransformation = remember(uiState.language, searchQuery) {
-            SyntaxHighlightTransformation(uiState.language, searchQuery)
+        val syntaxTransformation = remember(uiState.language, searchQuery, analysis) {
+            SyntaxHighlightTransformation(uiState.language, searchQuery, analysis)
         }
 
         Box(
@@ -246,20 +261,87 @@ fun NanoEditorScreen(
                     .verticalScroll(scrollState)
                     .padding(vertical = 10.dp),
             ) {
-                // Line number gutter
+                // Line number + diagnostic marker gutter
                 Column(
                     horizontalAlignment = Alignment.End,
                     modifier = Modifier
-                        .padding(start = 8.dp, end = 10.dp),
+                        .background(Color(0xFF060A0E))
+                        .padding(start = 6.dp, end = 8.dp)
+                        .testTag("nano_line_gutter"),
                 ) {
                     for (line in 1..lineCount) {
-                        Text(
-                            text = line.toString(),
-                            style = MonoTextStyles.CodeEditor,
-                            color = if (line - 1 == activeLineIndex) Color(0xFF38BDF8) else Color(0xFF64748B),
-                        )
+                        val lineIdx = line - 1
+                        val lineDiags = analysis.diagnosticsByLine[lineIdx].orEmpty()
+                        val hasError = lineDiags.any { it.severity == DiagnosticSeverity.ERROR }
+                        val hasWarning = !hasError && lineDiags.any { it.severity == DiagnosticSeverity.WARNING }
+                        val isActive = lineIdx == activeLineIndex
+                        val rowBg = when {
+                            hasError -> Color(0x33EF4444)
+                            hasWarning -> Color(0x28F59E0B)
+                            isActive -> Color(0x1E38BDF8)
+                            else -> Color.Transparent
+                        }
+                        val numColor = when {
+                            hasError -> Color(0xFFF87171)
+                            hasWarning -> Color(0xFFFBBF24)
+                            isActive -> Color(0xFF38BDF8)
+                            else -> Color(0xFF64748B)
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .height(gutterLineHeightDp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(rowBg)
+                                .clickable(enabled = lineDiags.isNotEmpty()) {
+                                    val target = lineDiags.first()
+                                    val safeOffset = target.startOffset.coerceIn(0, textFieldValue.text.length)
+                                    textFieldValue = textFieldValue.copy(selection = TextRange(safeOffset))
+                                    activeLineIndex = target.lineIndex
+                                    showProblemsPanel = true
+                                }
+                                .padding(horizontal = 3.dp)
+                                .testTag("gutter_line_$line"),
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.size(10.dp),
+                            ) {
+                                when {
+                                    hasError -> Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFFF87171))
+                                            .testTag("gutter_error_marker_$line"),
+                                    )
+                                    hasWarning -> Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFFFBBF24))
+                                            .testTag("gutter_warning_marker_$line"),
+                                    )
+                                }
+                            }
+                            Text(
+                                text = line.toString(),
+                                style = MonoTextStyles.CodeEditor,
+                                color = numColor,
+                            )
+                        }
                     }
                 }
+
+                // Vertical gutter divider
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .fillMaxHeight()
+                        .background(Color(0xFF1E293B)),
+                )
 
                 // Monospace Editable Buffer
                 BasicTextField(
@@ -278,9 +360,51 @@ fun NanoEditorScreen(
                     modifier = Modifier
                         .weight(1f)
                         .horizontalScroll(horizontalScroll)
-                        .padding(end = 12.dp)
+                        .padding(start = 8.dp, end = 12.dp)
                         .testTag("nano_code_editor"),
                 )
+            }
+        }
+
+        // Collapsible Diagnostics / Problems Drawer
+        AnimatedVisibility(visible = showProblemsPanel && analysis.diagnostics.isNotEmpty()) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("nano_problems_drawer"),
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "Diagnostics (${analysis.errorCount} errors, ${analysis.warningCount} warnings)",
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        IconButton(onClick = { showProblemsPanel = false }, modifier = Modifier.size(24.dp)) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close diagnostics", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier.height((analysis.diagnostics.size.coerceAtMost(4) * 38).dp),
+                    ) {
+                        items(analysis.diagnostics, key = { "${it.lineIndex}:${it.column}:${it.ruleCode}" }) { diag ->
+                            DiagnosticRow(
+                                diagnostic = diag,
+                                onJump = {
+                                    val safeOffset = diag.startOffset.coerceIn(0, textFieldValue.text.length)
+                                    textFieldValue = textFieldValue.copy(selection = TextRange(safeOffset))
+                                    activeLineIndex = diag.lineIndex
+                                },
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -294,7 +418,7 @@ fun NanoEditorScreen(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
             ) {
@@ -302,6 +426,15 @@ fun NanoEditorScreen(
                     text = uiState.statusBarMessage,
                     style = MonoTextStyles.HexBadge,
                     modifier = Modifier.weight(1f),
+                )
+                DiagnosticsBadgePill(
+                    errorCount = analysis.errorCount,
+                    warningCount = analysis.warningCount,
+                    onClick = {
+                        if (analysis.diagnostics.isNotEmpty()) {
+                            showProblemsPanel = !showProblemsPanel
+                        }
+                    },
                 )
                 Text(
                     text = "Ln ${activeLineIndex + 1}/$lineCount • ${uiState.targetDeviceId}",
@@ -563,50 +696,109 @@ private fun TransferScriptDialog(
     )
 }
 
+@Composable
+private fun DiagnosticsBadgePill(
+    errorCount: Int,
+    warningCount: Int,
+    onClick: () -> Unit,
+) {
+    val containerColor = when {
+        errorCount > 0 -> MaterialTheme.colorScheme.errorContainer
+        warningCount > 0 -> MaterialTheme.colorScheme.tertiaryContainer
+        else -> MaterialTheme.colorScheme.primaryContainer
+    }
+    val contentColor = when {
+        errorCount > 0 -> MaterialTheme.colorScheme.onErrorContainer
+        warningCount > 0 -> MaterialTheme.colorScheme.onTertiaryContainer
+        else -> MaterialTheme.colorScheme.onPrimaryContainer
+    }
+    val label = when {
+        errorCount > 0 && warningCount > 0 -> "$errorCount err • $warningCount warn"
+        errorCount > 0 -> "$errorCount err"
+        warningCount > 0 -> "$warningCount warn"
+        else -> "Syntax OK"
+    }
+    Surface(
+        onClick = onClick,
+        color = containerColor,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.testTag("nano_diagnostics_pill"),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+        ) {
+            Icon(
+                imageVector = when {
+                    errorCount > 0 -> Icons.Filled.Error
+                    warningCount > 0 -> Icons.Filled.Warning
+                    else -> Icons.Filled.CheckCircle
+                },
+                contentDescription = "Syntax diagnostics",
+                tint = contentColor,
+                modifier = Modifier.size(12.dp),
+            )
+            Text(
+                text = label,
+                style = MonoTextStyles.HexBadge,
+                color = contentColor,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticRow(
+    diagnostic: CodeDiagnostic,
+    onJump: () -> Unit,
+) {
+    val isErr = diagnostic.severity == DiagnosticSeverity.ERROR
+    Surface(
+        onClick = onJump,
+        color = if (isErr) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.65f)
+        else MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            Icon(
+                imageVector = if (isErr) Icons.Filled.Error else Icons.Filled.Warning,
+                contentDescription = null,
+                tint = if (isErr) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                text = "Ln ${diagnostic.oneBasedLine}:${diagnostic.oneBasedColumn}",
+                style = MonoTextStyles.HexBadge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = diagnostic.message,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
 private class SyntaxHighlightTransformation(
     private val language: ScriptLanguage,
     private val searchQuery: String,
+    private val analysis: SyntaxAnalysisResult,
 ) : VisualTransformation {
 
-    private val stringRegex = Regex("\"([^\"\\\\]|\\\\.)*\"|'([^'\\\\]|\\\\.)*'")
-    private val numberRegex = Regex("\\b(0x[0-9a-fA-F]+|\\d+(\\.\\d+)?)\\b")
-    private val commentRegex = Regex("${Regex.escape(language.commentPrefix)}.*$")
-    private val keywordRegex = Regex("\\b(${language.keywords.joinToString("|") { Regex.escape(it) }})\\b")
-
     override fun filter(text: AnnotatedString): TransformedText {
-        val src = text.text
-        val highlighted = buildAnnotatedString {
-            append(src)
-            keywordRegex.findAll(src).forEach { m ->
-                addStyle(SpanStyle(color = Color(0xFF7DD3FC), fontWeight = FontWeight.SemiBold), m.range.first, m.range.last + 1)
-            }
-            numberRegex.findAll(src).forEach { m ->
-                addStyle(SpanStyle(color = Color(0xFFFBBF24)), m.range.first, m.range.last + 1)
-            }
-            stringRegex.findAll(src).forEach { m ->
-                addStyle(SpanStyle(color = Color(0xFF86EFAC)), m.range.first, m.range.last + 1)
-            }
-            var offset = 0
-            src.lineSequence().forEach { line ->
-                commentRegex.find(line)?.let { m ->
-                    addStyle(
-                        SpanStyle(color = Color(0xFF94A3B8)),
-                        offset + m.range.first,
-                        offset + m.range.last + 1,
-                    )
-                }
-                offset += line.length + 1
-            }
-            if (searchQuery.isNotBlank()) {
-                Regex(Regex.escape(searchQuery), RegexOption.IGNORE_CASE).findAll(src).forEach { m ->
-                    addStyle(
-                        SpanStyle(background = Color(0xFFF59E0B), color = Color.Black),
-                        m.range.first,
-                        m.range.last + 1,
-                    )
-                }
-            }
-        }
+        val highlighted = ScriptSyntaxEngine.buildHighlightedText(
+            source = text.text,
+            language = language,
+            searchQuery = searchQuery,
+            analysis = analysis,
+        )
         return TransformedText(highlighted, OffsetMapping.Identity)
     }
 }
