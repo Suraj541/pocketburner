@@ -15,11 +15,13 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.SettingsInputComponent
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.SettingsInputComponent
+import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -54,6 +56,8 @@ import com.example.ui.nano.NanoViewModel
 import com.example.ui.terminal.TerminalScreen
 import com.example.ui.terminal.TerminalViewModel
 import com.example.ui.theme.PocketBurnerTheme
+import com.example.ui.vulnforge.VulnForgeScreen
+import com.example.ui.vulnforge.VulnForgeViewModel
 
 sealed class PocketDestination(
     val route: String,
@@ -66,6 +70,7 @@ sealed class PocketDestination(
     data object Connect : PocketDestination("connect", "Connect", Icons.Filled.SettingsInputComponent, Icons.Outlined.SettingsInputComponent)
     data object Terminal : PocketDestination("terminal", "Term", Icons.Filled.Terminal, Icons.Outlined.Terminal)
     data object Nano : PocketDestination("nano", "Nano", Icons.Filled.Code, Icons.Outlined.Code)
+    data object VulnForge : PocketDestination("vulnforge", "VulnForge", Icons.Filled.Security, Icons.Outlined.Security)
 }
 
 class MainActivity : ComponentActivity() {
@@ -76,6 +81,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             PocketBurnerTheme {
                 PocketBurnerRoot(container = container)
+            }
+            composable(PocketDestination.VulnForge.route) {
+                VulnForgeScreen(viewModel = vulnForgeViewModel)
             }
         }
     }
@@ -93,6 +101,7 @@ fun PocketBurnerRoot(container: AppContainer) {
             PocketDestination.Connect,
             PocketDestination.Terminal,
             PocketDestination.Nano,
+            PocketDestination.VulnForge,
         )
     }
 
@@ -101,6 +110,7 @@ fun PocketBurnerRoot(container: AppContainer) {
     val connectViewModel: ConnectViewModel = viewModel(factory = ConnectViewModel.Factory(container))
     val terminalViewModel: TerminalViewModel = viewModel(factory = TerminalViewModel.Factory(container))
     val nanoViewModel: NanoViewModel = viewModel(factory = NanoViewModel.Factory(container))
+    val vulnForgeViewModel: VulnForgeViewModel = viewModel(factory = VulnForgeViewModel.Factory(container))
 
     val navigateTo: (String) -> Unit = { route ->
         navController.navigate(route) {
@@ -164,7 +174,7 @@ fun PocketBurnerRoot(container: AppContainer) {
 
                 NavHost(
                     navController = navController,
-                    startDestination = PocketDestination.Burner.route,
+                    startDestination = PocketDestination.VulnForge.route,
                     modifier = Modifier.weight(1f),
                 ) {
                     composable(PocketDestination.Burner.route) {

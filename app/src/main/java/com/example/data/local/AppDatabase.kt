@@ -16,8 +16,13 @@ import androidx.room.RoomDatabase
         RepoSourceEntity::class,
         ScriptEntity::class,
         ConnectionProfileEntity::class,
+        VulnerabilityEntity::class,
+        LabEntity::class,
+        LabSnapshotEntity::class,
+        LabEventEntity::class,
+        VulnDataSourceEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -26,6 +31,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun repoSourceDao(): RepoSourceDao
     abstract fun scriptDao(): ScriptDao
     abstract fun connectionProfileDao(): ConnectionProfileDao
+    abstract fun vulnForgeDao(): VulnForgeDao
 
     companion object {
         @Volatile

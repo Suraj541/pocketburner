@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.data.local.AppDatabase
 import com.example.data.local.SettingsStore
 import com.example.data.local.TaxonomyRepository
+import com.example.data.local.VulnForgeRepository
 import com.example.engine.FirmwareCatalogEngine
 import com.example.engine.FirmwareIntegrityService
 import com.example.engine.FlashProtocolEngine
@@ -15,6 +16,7 @@ class AppContainer(context: Context) {
     val database: AppDatabase = AppDatabase.getInstance(appContext)
     val settingsStore: SettingsStore = SettingsStore(appContext)
     val taxonomyRepository: TaxonomyRepository = TaxonomyRepository(database.taxonomyDao())
+    val vulnForgeRepository: VulnForgeRepository = VulnForgeRepository(database.vulnForgeDao())
     val transportManager: TransportManager = TransportManager(appContext, settingsStore)
     val firmwareIntegrityService: FirmwareIntegrityService = FirmwareIntegrityService()
     val firmwareCatalogEngine: FirmwareCatalogEngine = FirmwareCatalogEngine(
